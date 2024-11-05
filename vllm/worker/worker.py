@@ -117,6 +117,10 @@ class Worker(LocalOrDistributedWorkerBase):
         self.gpu_cache: Optional[List[List[torch.Tensor]]] = None
         self._seq_group_metadata_cache: Dict[str, SequenceGroupMetadata] = {}
 
+        #Prefix GPU Cache
+        n_layers = self.model_config.get_num_layers(self.parallel_config)
+        self.prefix_gpu_cache = [(None, None) for _ in range(n_layers) ]
+
         # Torch profiler. Enabled and configured through env vars:
         # VLLM_TORCH_PROFILER_DIR=/path/to/save/trace
         if envs.VLLM_TORCH_PROFILER_DIR:
@@ -286,6 +290,33 @@ class Worker(LocalOrDistributedWorkerBase):
             f"Initial free memory {self.init_gpu_memory}, current free memory"
             f" {free_gpu_memory}. This happens when the GPU memory was "
             "not properly cleaned up before initializing the vLLM instance.")
+
+    @torch.inference_mode()
+    def fill_prefix_kv_cache(self, prefix_token_ids:List[int]):
+        assert self.model_config.enable_relay_attention
+        assert len(prefix_token_ids) <= self.prefix_gpu_cache[0][0].size(1)
+        self.model_runner.fill_prefix_kv_cache(prefix_token_ids, self.prefix_gpu_cache)
+        torch.cuda.synchronize()
+
+    def init_prefix_cache(self) -> None:
+        # relay attention will use a separate kv cache for the shared prefix
+        if self.model_config.enable_relay_attention:
+            max_len = self.model_config.max_model_len
+            n_kvheads = self.model_config.get_num_kv_heads(self.parallel_config)
+            head_dim = self.model_config.get_head_size()
+            n_layers = self.model_config.get_num_layers(self.parallel_config)
+            self.prefix_gpu_cache = [(torch.empty(1, max_len, n_kvheads, head_dim,
+                                                  dtype=self.model_config.dtype,
+                                                  device='cuda'),
+                                      torch.empty(1, max_len, n_kvheads, head_dim,
+                                                  dtype=self.model_config.dtype,
+                                                  device='cuda'))
+                                      for _ in range(n_layers) ]
+        else:
+            # use a placeholder to keep consistent interface
+            n_layers = self.model_config.get_num_layers(self.parallel_config)
+            self.prefix_gpu_cache = [(None, None) for _ in range(n_layers) ]
+
 
     def initialize_cache(self, num_gpu_blocks: int,
                          num_cpu_blocks: int) -> None:

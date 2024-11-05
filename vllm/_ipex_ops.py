@@ -51,6 +51,7 @@ class ipex_ops:
 
     @staticmethod
     def paged_attention_v1(
+        lse: torch.Tensor,
         out: torch.Tensor,
         query: torch.Tensor,
         key_cache: torch.Tensor,
@@ -83,6 +84,7 @@ class ipex_ops:
                1).repeat_interleave(num_queries_per_tokens).flatten()
         # todo: ipex will refactor namespace
         torch.xpu.paged_attention_v1(  # type: ignore
+            lse,
             out,
             query.contiguous(),
             key_cache.view_as(value_cache),
@@ -98,9 +100,9 @@ class ipex_ops:
 
     @staticmethod
     def paged_attention_v2(
+        lse: torch.Tensor,
         out: torch.Tensor,
-        exp_sum: torch.Tensor,
-        max_logits: torch.Tensor,
+        tmp_lse: torch.Tensor,
         tmp_out: torch.Tensor,
         query: torch.Tensor,
         key_cache: torch.Tensor,
@@ -133,9 +135,9 @@ class ipex_ops:
                1).repeat_interleave(num_queries_per_tokens).flatten()
         # todo: ipex will refactor namespace
         torch.xpu.paged_attention_v2(  # type: ignore
+            lse,
             out,
-            exp_sum,
-            max_logits,
+            tmp_lse,
             tmp_out,
             query.contiguous(),
             key_cache.view_as(value_cache),

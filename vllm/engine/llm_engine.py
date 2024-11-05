@@ -16,8 +16,8 @@ import vllm.envs as envs
 from vllm.config import (CacheConfig, DecodingConfig, DeviceConfig,
                          EngineConfig, LoadConfig, LoRAConfig, ModelConfig,
                          ObservabilityConfig, ParallelConfig,
-                         PromptAdapterConfig, SchedulerConfig,
-                         SpeculativeConfig)
+                         PromptAdapterConfig, SpeculativeConfig,
+                         SchedulerConfig, SystemPromptConfig)
 from vllm.core.scheduler import (ScheduledSequenceGroup, Scheduler,
                                  SchedulerOutputs)
 from vllm.engine.arg_utils import EngineArgs
@@ -223,6 +223,7 @@ class LLMEngine:
         cache_config: CacheConfig,
         parallel_config: ParallelConfig,
         scheduler_config: SchedulerConfig,
+        sys_prompt_config: SystemPromptConfig,
         device_config: DeviceConfig,
         load_config: LoadConfig,
         lora_config: Optional[LoRAConfig],
@@ -254,7 +255,8 @@ class LLMEngine:
             "num_scheduler_steps=%d, chunked_prefill_enabled=%s "
             "multi_step_stream_outputs=%s, enable_prefix_caching=%s, "
             "use_async_output_proc=%s, use_cached_outputs=%s, "
-            "chat_template_text_format=%s, mm_processor_kwargs=%s)",
+            "chat_template_text_format=%s, mm_processor_kwargs=%s, "
+            "enable_relay_attention=%s)",
             VLLM_VERSION,
             model_config.model,
             speculative_config,
@@ -291,6 +293,7 @@ class LLMEngine:
             use_cached_outputs,
             model_config.chat_template_text_format,
             model_config.mm_processor_kwargs,
+            model_config.enable_relay_attention
         )
         # TODO(woosuk): Print more configs in debug mode.
         self.model_config = model_config
@@ -298,6 +301,7 @@ class LLMEngine:
         self.lora_config = lora_config
         self.parallel_config = parallel_config
         self.scheduler_config = scheduler_config
+        self.sys_prompt_config = sys_prompt_config
         self.device_config = device_config
         self.speculative_config = speculative_config
         self.load_config = load_config
@@ -485,6 +489,11 @@ class LLMEngine:
         The workers will determine the number of blocks in both the GPU cache
         and the swap CPU cache.
         """
+
+        # allocate the system KV cache first to allow precise memory usage profiling
+        # TODO: move this call into executor classes
+        self.model_executor._run_workers("init_prefix_cache")
+
         num_gpu_blocks, num_cpu_blocks = (
             self.model_executor.determine_num_available_blocks())
 
@@ -500,6 +509,16 @@ class LLMEngine:
         self.cache_config.num_cpu_blocks = num_cpu_blocks
 
         self.model_executor.initialize_cache(num_gpu_blocks, num_cpu_blocks)
+
+        # TODO: move this call into executor classes
+        if self.model_config.enable_relay_attention:
+            if self.sys_prompt_config.has_sys_prompt:
+                self.fill_prefix_kv_cache(
+                    shared_prefix=self.sys_prompt_config.get_shared_prefix())
+            else:
+                logger.warning("Though enable_relay_attention is set as true, "
+                               "relay attention is not activated due to no system "
+                               "prompt is provided.")
 
     @classmethod
     def _get_executor_cls(cls,
@@ -636,6 +655,18 @@ class LLMEngine:
         if self.prompt_adapter_config:
             self.prompt_adapter_config.verify_with_model_config(
                 self.model_config)
+
+    def fill_prefix_kv_cache(self, shared_prefix:str,
+                             shared_prefix_toks:Optional[List[int]]=None):
+        if shared_prefix_toks is None:
+            assert isinstance(shared_prefix, str)
+            shared_prefix_tokenized = self.tokenizer.encode(shared_prefix)
+        else:
+            assert shared_prefix is None
+            shared_prefix_tokenized = shared_prefix_toks
+        # TODO (ray): we may need to set the tokenizer to not prepend <bos> token for later requests
+        logger.info(f'Filling the shared prefix kv cache with {len(shared_prefix_tokenized)} tokens.')
+        self.model_executor._run_workers('fill_prefix_kv_cache', prefix_token_ids=shared_prefix_tokenized)
 
     def _add_processed_request(
         self,
@@ -817,6 +848,14 @@ class LLMEngine:
         if inputs is not None:
             prompt = inputs
         assert prompt is not None and params is not None
+
+        if self.sys_prompt_config.has_sys_prompt:
+            # only if we choose to specify the prompt and template during initialization
+            # the prompt will be formatted automatically
+            prompt = self.sys_prompt_config.get_formatted_request(
+                user_prompt=prompt,
+                include_sys_prompt=(not self.model_config.enable_relay_attention)
+            )
 
         if lora_request is not None and not self.lora_config:
             raise ValueError(f"Got lora_request {lora_request} but LoRA is "

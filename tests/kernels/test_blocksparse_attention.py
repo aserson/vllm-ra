@@ -214,8 +214,13 @@ def test_paged_attention(
 
     # Call the paged attention kernel.
     output = torch.empty_like(query)
+    lse = torch.empty(
+        size=(output.shape[0], output.shape[1]),
+        dtype=torch.float32,
+    )
     if version == "v1":
         ops.paged_attention_v1(
+            lse,
             output,
             query,
             key_cache,
@@ -240,19 +245,18 @@ def test_paged_attention(
         num_partitions = ((max_seq_len + PARTITION_SIZE - 1) // PARTITION_SIZE)
         assert PARTITION_SIZE % block_size == 0
         num_seqs, num_heads, head_size = output.shape
+        tmp_lse = torch.empty(
+            size=(num_seqs, num_heads, num_partitions),
+            dtype=torch.float32,
+        )
         tmp_output = torch.empty(
             size=(num_seqs, num_heads, num_partitions, head_size),
             dtype=output.dtype,
         )
-        exp_sums = torch.empty(
-            size=(num_seqs, num_heads, num_partitions),
-            dtype=torch.float32,
-        )
-        max_logits = torch.empty_like(exp_sums)
         ops.paged_attention_v2(
+            lse,
             output,
-            exp_sums,
-            max_logits,
+            tmp_lse,
             tmp_output,
             query,
             key_cache,

@@ -88,11 +88,10 @@ template <typename scalar_t, typename cache_t, int HEAD_SIZE, int BLOCK_SIZE,
           bool IS_BLOCK_SPARSE,
           int PARTITION_SIZE = 0>  // Zero means no partitioning.
 __device__ void paged_attention_kernel(
-    float* __restrict__ exp_sums,  // [num_seqs, num_heads, max_num_partitions]
-    float* __restrict__ max_logits,  // [num_seqs, num_heads,
-                                     // max_num_partitions]
-    scalar_t* __restrict__ out,  // [num_seqs, num_heads, max_num_partitions,
-                                 // head_size]
+    float* __restrict__ lse,              // [num_seqs, num_heads,
+                                          // max_num_partitions]
+    scalar_t* __restrict__ out,           // [num_seqs, num_heads,
+                                          // max_num_partitions, head_size]
     const scalar_t* __restrict__ q,       // [num_seqs, num_heads, head_size]
     const cache_t* __restrict__ k_cache,  // [num_blocks, num_kv_heads,
                                           // head_size/x, block_size, x]
@@ -345,15 +344,12 @@ __device__ void paged_attention_kernel(
   }
   __syncthreads();
 
-  // If partitioning is enabled, store the max logit and exp_sum.
-  if (USE_PARTITIONING && thread_idx == 0) {
-    float* max_logits_ptr = max_logits +
-                            seq_idx * num_heads * max_num_partitions +
-                            head_idx * max_num_partitions + partition_idx;
-    *max_logits_ptr = qk_max;
-    float* exp_sums_ptr = exp_sums + seq_idx * num_heads * max_num_partitions +
-                          head_idx * max_num_partitions + partition_idx;
-    *exp_sums_ptr = exp_sum;
+  // Always store lse regardless whether to use partitioning
+  if (thread_idx == 0) {
+    float* lse_ptr = lse + seq_idx * num_heads * max_num_partitions
+                         + head_idx * max_num_partitions
+                         + partition_idx;
+    *lse_ptr = logf(exp_sum) + qk_max;
   }
 
   // Each thread will fetch 16 bytes from the value cache at a time.
@@ -500,6 +496,7 @@ template <typename scalar_t, typename cache_t, int HEAD_SIZE, int BLOCK_SIZE,
           int NUM_THREADS, vllm::Fp8KVCacheDataType KV_DTYPE,
           bool IS_BLOCK_SPARSE>
 __global__ void paged_attention_v1_kernel(
+    float* __restrict__ lse,              // [num_seqs, num_heads]
     scalar_t* __restrict__ out,           // [num_seqs, num_heads, head_size]
     const scalar_t* __restrict__ q,       // [num_seqs, num_heads, head_size]
     const cache_t* __restrict__ k_cache,  // [num_blocks, num_kv_heads,
@@ -518,9 +515,8 @@ __global__ void paged_attention_v1_kernel(
     const int blocksparse_block_size, const int blocksparse_head_sliding_step) {
   paged_attention_kernel<scalar_t, cache_t, HEAD_SIZE, BLOCK_SIZE, NUM_THREADS,
                          KV_DTYPE, IS_BLOCK_SPARSE>(
-      /* exp_sums */ nullptr, /* max_logits */ nullptr, out, q, k_cache,
-      v_cache, num_kv_heads, scale, block_tables, seq_lens,
-      max_num_blocks_per_seq, alibi_slopes, q_stride, kv_block_stride,
+      lse, out, q, k_cache, v_cache, num_kv_heads, scale, block_tables,
+      seq_lens, max_num_blocks_per_seq, alibi_slopes, q_stride, kv_block_stride,
       kv_head_stride, k_scale, v_scale, tp_rank, blocksparse_local_blocks,
       blocksparse_vert_stride, blocksparse_block_size,
       blocksparse_head_sliding_step);
@@ -532,8 +528,7 @@ template <typename scalar_t, typename cache_t, int HEAD_SIZE, int BLOCK_SIZE,
           bool IS_BLOCK_SPARSE,
           int PARTITION_SIZE>
 __global__ void paged_attention_v2_kernel(
-    float* __restrict__ exp_sums,  // [num_seqs, num_heads, max_num_partitions]
-    float* __restrict__ max_logits,       // [num_seqs, num_heads,
+    float* __restrict__ tmp_lse,          // [num_seqs, num_heads,
                                           // max_num_partitions]
     scalar_t* __restrict__ tmp_out,       // [num_seqs, num_heads,
                                           // max_num_partitions, head_size]
@@ -554,7 +549,7 @@ __global__ void paged_attention_v2_kernel(
     const int blocksparse_block_size, const int blocksparse_head_sliding_step) {
   paged_attention_kernel<scalar_t, cache_t, HEAD_SIZE, BLOCK_SIZE, NUM_THREADS,
                          KV_DTYPE, IS_BLOCK_SPARSE, PARTITION_SIZE>(
-      exp_sums, max_logits, tmp_out, q, k_cache, v_cache, num_kv_heads, scale,
+      tmp_lse, tmp_out, q, k_cache, v_cache, num_kv_heads, scale,
       block_tables, seq_lens, max_num_blocks_per_seq, alibi_slopes, q_stride,
       kv_block_stride, kv_head_stride, k_scale, v_scale, tp_rank,
       blocksparse_local_blocks, blocksparse_vert_stride, blocksparse_block_size,
@@ -565,10 +560,9 @@ __global__ void paged_attention_v2_kernel(
 template <typename scalar_t, int HEAD_SIZE, int NUM_THREADS,
           int PARTITION_SIZE>
 __global__ void paged_attention_v2_reduce_kernel(
+    float* __restrict__ lse,               // [num_seqs, num_heads]
     scalar_t* __restrict__ out,            // [num_seqs, num_heads, head_size]
-    const float* __restrict__ exp_sums,    // [num_seqs, num_heads,
-                                           // max_num_partitions]
-    const float* __restrict__ max_logits,  // [num_seqs, num_heads,
+    const float* __restrict__ tmp_lse,     // [num_seqs, num_heads,
                                            // max_num_partitions]
     const scalar_t* __restrict__ tmp_out,  // [num_seqs, num_heads,
                                            // max_num_partitions, head_size]
@@ -589,6 +583,16 @@ __global__ void paged_attention_v2_reduce_kernel(
     for (int i = threadIdx.x; i < HEAD_SIZE; i += blockDim.x) {
       out_ptr[i] = tmp_out_ptr[i];
     }
+    // Copy lse
+    if (threadIdx.x == 0) {
+      float* lse_ptr = lse + seq_idx * num_heads + head_idx;
+      // NOTE: when using captured graph, tmp_lse always has the shape of
+      // (num_reqs, num_heads, max_num_partitions)
+      // &(tmp_lse[seq_idx][head_idx][0]) should be calculated as below
+      // (the stride of the final dim is max_num_partitions)
+      *lse_ptr =  *(tmp_lse + seq_idx * num_heads * max_num_partitions
+                            + head_idx * max_num_partitions);
+    }
     // Terminate the thread block.
     return;
   }
@@ -597,55 +601,51 @@ __global__ void paged_attention_v2_reduce_kernel(
   const int warp_idx = threadIdx.x / WARP_SIZE;
   const int lane = threadIdx.x % WARP_SIZE;
 
+  // TODO (ray): reduce the external smem allocation
   // Size: 2 * num_partitions.
   extern __shared__ char shared_mem[];
   // Workspace for reduction.
   __shared__ float red_smem[2 * NUM_WARPS];
 
-  // Load max logits to shared memory.
-  float* shared_max_logits = reinterpret_cast<float*>(shared_mem);
-  const float* max_logits_ptr = max_logits +
-                                seq_idx * num_heads * max_num_partitions +
-                                head_idx * max_num_partitions;
-  float max_logit = -FLT_MAX;
+  // Load lse to shared memory.
+  float* lses_smem = reinterpret_cast<float*>(shared_mem);
+  const float* tmp_lses_ptr = tmp_lse +
+                              seq_idx * num_heads *  max_num_partitions +
+                              head_idx * max_num_partitions;
+  float max_lse = -FLT_MAX; // per thread max lse
   for (int i = threadIdx.x; i < num_partitions; i += blockDim.x) {
-    const float l = max_logits_ptr[i];
-    shared_max_logits[i] = l;
-    max_logit = fmaxf(max_logit, l);
+    const float l = tmp_lses_ptr[i];
+    lses_smem[i] = l;
+    max_lse = fmaxf(max_lse, l);
   }
   __syncthreads();
 
-  // Get the global max logit.
+  // Get the global max lse.
   // Reduce within the warp.
 #pragma unroll
   for (int mask = WARP_SIZE / 2; mask >= 1; mask /= 2) {
-    max_logit = fmaxf(max_logit, VLLM_SHFL_XOR_SYNC(max_logit, mask));
+    max_lse = fmaxf(max_lse, VLLM_SHFL_XOR_SYNC(max_lse, mask));
   }
   if (lane == 0) {
-    red_smem[warp_idx] = max_logit;
+    red_smem[warp_idx] = max_lse;
   }
   __syncthreads();
   // Reduce across warps.
-  max_logit = lane < NUM_WARPS ? red_smem[lane] : -FLT_MAX;
+  max_lse = lane < NUM_WARPS ? red_smem[lane] : -FLT_MAX;
 #pragma unroll
   for (int mask = NUM_WARPS / 2; mask >= 1; mask /= 2) {
-    max_logit = fmaxf(max_logit, VLLM_SHFL_XOR_SYNC(max_logit, mask));
+    max_lse = fmaxf(max_lse, VLLM_SHFL_XOR_SYNC(max_lse, mask));
   }
   // Broadcast the max value to all threads.
-  max_logit = VLLM_SHFL_SYNC(max_logit, 0);
+  max_lse = VLLM_SHFL_SYNC(max_lse, 0);
 
-  // Load rescaled exp sums to shared memory.
-  float* shared_exp_sums =
-      reinterpret_cast<float*>(shared_mem + sizeof(float) * num_partitions);
-  const float* exp_sums_ptr = exp_sums +
-                              seq_idx * num_heads * max_num_partitions +
-                              head_idx * max_num_partitions;
-  float global_exp_sum = 0.0f;
+  float global_exp_sum = 0.f;
   for (int i = threadIdx.x; i < num_partitions; i += blockDim.x) {
-    float l = shared_max_logits[i];
-    float rescaled_exp_sum = exp_sums_ptr[i] * expf(l - max_logit);
-    global_exp_sum += rescaled_exp_sum;
-    shared_exp_sums[i] = rescaled_exp_sum;
+    float l = lses_smem[i];
+    float l_shift = expf(l - max_lse); // minus max for numerical stability,
+                                       // __expf() ?
+    global_exp_sum += l_shift;
+    lses_smem[i] = l_shift; // thread-safe, no race condition
   }
   __syncthreads();
   global_exp_sum = block_sum<NUM_WARPS>(&red_smem[NUM_WARPS], global_exp_sum);
@@ -661,7 +661,7 @@ __global__ void paged_attention_v2_reduce_kernel(
   for (int i = threadIdx.x; i < HEAD_SIZE; i += NUM_THREADS) {
     float acc = 0.0f;
     for (int j = 0; j < num_partitions; ++j) {
-      acc += to_float(tmp_out_ptr[j * HEAD_SIZE + i]) * shared_exp_sums[j] *
+      acc += to_float(tmp_out_ptr[j * HEAD_SIZE + i]) * lses_smem[j] *
              inv_global_exp_sum;
     }
     from_float(out_ptr[i], acc);
@@ -679,25 +679,25 @@ __global__ void paged_attention_v2_reduce_kernel(
   vllm::paged_attention_v1_kernel<T, CACHE_T, HEAD_SIZE, BLOCK_SIZE,        \
                                   NUM_THREADS, KV_DTYPE, IS_BLOCK_SPARSE>   \
       <<<grid, block, shared_mem_size, stream>>>(                           \
-          out_ptr, query_ptr, key_cache_ptr, value_cache_ptr, num_kv_heads, \
-          scale, block_tables_ptr, seq_lens_ptr, max_num_blocks_per_seq,    \
-          alibi_slopes_ptr, q_stride, kv_block_stride, kv_head_stride,      \
-          k_scale, v_scale, tp_rank, blocksparse_local_blocks,              \
-          blocksparse_vert_stride, blocksparse_block_size,                  \
-          blocksparse_head_sliding_step);
+          lse_ptr, out_ptr, query_ptr, key_cache_ptr, value_cache_ptr,      \
+          num_kv_heads, scale, block_tables_ptr, seq_lens_ptr,              \
+          max_num_blocks_per_seq, alibi_slopes_ptr, q_stride,               \
+          kv_block_stride, kv_head_stride, k_scale, v_scale, tp_rank,       \
+          blocksparse_local_blocks, blocksparse_vert_stride,                \
+          blocksparse_block_size, blocksparse_head_sliding_step);
 
 // TODO(woosuk): Tune NUM_THREADS.
 template <typename T, typename CACHE_T, int BLOCK_SIZE,
           vllm::Fp8KVCacheDataType KV_DTYPE, bool IS_BLOCK_SPARSE,
           int NUM_THREADS = 128>
 void paged_attention_v1_launcher(
-    torch::Tensor& out, torch::Tensor& query, torch::Tensor& key_cache,
-    torch::Tensor& value_cache, int num_kv_heads, float scale,
-    torch::Tensor& block_tables, torch::Tensor& seq_lens, int max_seq_len,
-    const c10::optional<torch::Tensor>& alibi_slopes, float k_scale,
-    float v_scale, const int tp_rank, const int blocksparse_local_blocks,
-    const int blocksparse_vert_stride, const int blocksparse_block_size,
-    const int blocksparse_head_sliding_step) {
+    torch::Tensor& lse, torch::Tensor& out, torch::Tensor& query,
+    torch::Tensor& key_cache, torch::Tensor& value_cache, int num_kv_heads,
+    float scale, torch::Tensor& block_tables, torch::Tensor& seq_lens,
+    int max_seq_len, const c10::optional<torch::Tensor>& alibi_slopes,
+    float k_scale, float v_scale, const int tp_rank,
+    const int blocksparse_local_blocks, const int blocksparse_vert_stride,
+    const int blocksparse_block_size, const int blocksparse_head_sliding_step) {
   int num_seqs = query.size(0);
   int num_heads = query.size(1);
   int head_size = query.size(2);
@@ -716,6 +716,7 @@ void paged_attention_v1_launcher(
           : nullptr;
 
   T* out_ptr = reinterpret_cast<T*>(out.data_ptr());
+  float* lse_ptr = reinterpret_cast<float*>(lse.data_ptr());
   T* query_ptr = reinterpret_cast<T*>(query.data_ptr());
   CACHE_T* key_cache_ptr = reinterpret_cast<CACHE_T*>(key_cache.data_ptr());
   CACHE_T* value_cache_ptr = reinterpret_cast<CACHE_T*>(value_cache.data_ptr());
@@ -772,9 +773,9 @@ void paged_attention_v1_launcher(
 #define CALL_V1_LAUNCHER(T, CACHE_T, BLOCK_SIZE, KV_DTYPE, IS_BLOCK_SPARSE)  \
   paged_attention_v1_launcher<T, CACHE_T, BLOCK_SIZE, KV_DTYPE,              \
                               IS_BLOCK_SPARSE>(                              \
-      out, query, key_cache, value_cache, num_kv_heads, scale, block_tables, \
-      seq_lens, max_seq_len, alibi_slopes, k_scale, v_scale, tp_rank,        \
-      blocksparse_local_blocks, blocksparse_vert_stride,                     \
+      lse, out, query, key_cache, value_cache, num_kv_heads, scale,          \
+      block_tables, seq_lens, max_seq_len, alibi_slopes, k_scale, v_scale,   \
+      tp_rank, blocksparse_local_blocks, blocksparse_vert_stride,            \
       blocksparse_block_size, blocksparse_head_sliding_step);
 
 #define CALL_V1_LAUNCHER_SPARSITY(T, CACHE_T, BLOCK_SIZE, IS_FP8_KV_CACHE) \
@@ -806,13 +807,14 @@ void paged_attention_v1_launcher(
   }
 
 void paged_attention_v1(
-    torch::Tensor& out,    // [num_seqs, num_heads, head_size]
-    torch::Tensor& query,  // [num_seqs, num_heads, head_size]
-    torch::Tensor&
-        key_cache,  // [num_blocks, num_heads, head_size/x, block_size, x]
-    torch::Tensor&
-        value_cache,       // [num_blocks, num_heads, head_size, block_size]
-    int64_t num_kv_heads,  // [num_heads]
+    torch::Tensor& lse,           // [num_seqs, num_heads]
+    torch::Tensor& out,           // [num_seqs, num_heads, head_size]
+    torch::Tensor& query,         // [num_seqs, num_heads, head_size]
+    torch::Tensor& key_cache,     // [num_blocks, num_heads, head_size/x,
+                                  // block_size, x]
+    torch::Tensor& value_cache,   // [num_blocks, num_heads, head_size,
+                                  // block_size]
+    int64_t num_kv_heads,         // [num_heads]
     double scale,
     torch::Tensor& block_tables,  // [num_seqs, max_num_blocks_per_seq]
     torch::Tensor& seq_lens,      // [num_seqs]
@@ -833,7 +835,7 @@ void paged_attention_v1(
                                   NUM_THREADS, KV_DTYPE, IS_BLOCK_SPARSE,      \
                                   PARTITION_SIZE>                              \
       <<<grid, block, shared_mem_size, stream>>>(                              \
-          exp_sums_ptr, max_logits_ptr, tmp_out_ptr, query_ptr, key_cache_ptr, \
+          tmp_lse_ptr, tmp_out_ptr, query_ptr, key_cache_ptr,                  \
           value_cache_ptr, num_kv_heads, scale, block_tables_ptr,              \
           seq_lens_ptr, max_num_blocks_per_seq, alibi_slopes_ptr, q_stride,    \
           kv_block_stride, kv_head_stride, k_scale, v_scale, tp_rank,          \
@@ -842,14 +844,14 @@ void paged_attention_v1(
   vllm::paged_attention_v2_reduce_kernel<T, HEAD_SIZE, NUM_THREADS,            \
                                          PARTITION_SIZE>                       \
       <<<reduce_grid, block, reduce_shared_mem_size, stream>>>(                \
-          out_ptr, exp_sums_ptr, max_logits_ptr, tmp_out_ptr, seq_lens_ptr,    \
+          lse_ptr, out_ptr, tmp_lse_ptr, tmp_out_ptr, seq_lens_ptr,            \
           max_num_partitions);
 
 template <typename T, typename CACHE_T, int BLOCK_SIZE,
           vllm::Fp8KVCacheDataType KV_DTYPE, bool IS_BLOCK_SPARSE,
           int NUM_THREADS = 128, int PARTITION_SIZE = 512>
 void paged_attention_v2_launcher(
-    torch::Tensor& out, torch::Tensor& exp_sums, torch::Tensor& max_logits,
+    torch::Tensor& lse, torch::Tensor& out, torch::Tensor& tmp_lse,
     torch::Tensor& tmp_out, torch::Tensor& query, torch::Tensor& key_cache,
     torch::Tensor& value_cache, int num_kv_heads, float scale,
     torch::Tensor& block_tables, torch::Tensor& seq_lens, int max_seq_len,
@@ -874,9 +876,9 @@ void paged_attention_v2_launcher(
           ? reinterpret_cast<const float*>(alibi_slopes.value().data_ptr())
           : nullptr;
 
+  float* lse_ptr = reinterpret_cast<float*>(lse.data_ptr());
   T* out_ptr = reinterpret_cast<T*>(out.data_ptr());
-  float* exp_sums_ptr = reinterpret_cast<float*>(exp_sums.data_ptr());
-  float* max_logits_ptr = reinterpret_cast<float*>(max_logits.data_ptr());
+  float* tmp_lse_ptr = reinterpret_cast<float*>(tmp_lse.data_ptr());
   T* tmp_out_ptr = reinterpret_cast<T*>(tmp_out.data_ptr());
   T* query_ptr = reinterpret_cast<T*>(query.data_ptr());
   CACHE_T* key_cache_ptr = reinterpret_cast<CACHE_T*>(key_cache.data_ptr());
@@ -936,7 +938,7 @@ void paged_attention_v2_launcher(
 #define CALL_V2_LAUNCHER(T, CACHE_T, BLOCK_SIZE, KV_DTYPE, IS_BLOCK_SPARSE)   \
   paged_attention_v2_launcher<T, CACHE_T, BLOCK_SIZE, KV_DTYPE,               \
                               IS_BLOCK_SPARSE>(                               \
-      out, exp_sums, max_logits, tmp_out, query, key_cache, value_cache,      \
+      lse, out, tmp_lse, tmp_out, query, key_cache, value_cache,              \
       num_kv_heads, scale, block_tables, seq_lens, max_seq_len, alibi_slopes, \
       k_scale, v_scale, tp_rank, blocksparse_local_blocks,                    \
       blocksparse_vert_stride, blocksparse_block_size,                        \
@@ -971,17 +973,17 @@ void paged_attention_v2_launcher(
   }
 
 void paged_attention_v2(
-    torch::Tensor& out,         // [num_seqs, num_heads, head_size]
-    torch::Tensor& exp_sums,    // [num_seqs, num_heads, max_num_partitions]
-    torch::Tensor& max_logits,  // [num_seqs, num_heads, max_num_partitions]
-    torch::Tensor&
-        tmp_out,  // [num_seqs, num_heads, max_num_partitions, head_size]
-    torch::Tensor& query,  // [num_seqs, num_heads, head_size]
-    torch::Tensor&
-        key_cache,  // [num_blocks, num_heads, head_size/x, block_size, x]
-    torch::Tensor&
-        value_cache,       // [num_blocks, num_heads, head_size, block_size]
-    int64_t num_kv_heads,  // [num_heads]
+    torch::Tensor& lse,           // [num_seqs, num_heads]
+    torch::Tensor& out,           // [num_seqs, num_heads, head_size]
+    torch::Tensor& tmp_lse,       // [num_seqs, num_heads, max_num_partitions]
+    torch::Tensor& tmp_out,       // [num_seqs, num_heads, max_num_partitions,
+                                  // head_size]
+    torch::Tensor& query,         // [num_seqs, num_heads, head_size]
+    torch::Tensor& key_cache,     // [num_blocks, num_heads, head_size/x,
+                                  // block_size, x]
+    torch::Tensor& value_cache,   // [num_blocks, num_heads, head_size,
+                                  // block_size]
+    int64_t num_kv_heads,         // [num_heads]
     double scale,
     torch::Tensor& block_tables,  // [num_seqs, max_num_blocks_per_seq]
     torch::Tensor& seq_lens,      // [num_seqs]

@@ -133,6 +133,7 @@ class ModelConfig:
                  quantization_param_path: Optional[str] = None,
                  enforce_eager: Optional[bool] = None,
                  max_context_len_to_capture: Optional[int] = None,
+                 enable_relay_attention: Optional[bool] = False,
                  max_seq_len_to_capture: Optional[int] = None,
                  max_logprobs: int = 20,
                  disable_sliding_window: bool = False,
@@ -164,6 +165,7 @@ class ModelConfig:
         if max_context_len_to_capture is not None:
             raise ValueError("`max_context_len_to_capture` is deprecated. "
                              "Use `max_seq_len_to_capture` instead.")
+        self.enable_relay_attention = enable_relay_attention
         self.max_seq_len_to_capture = max_seq_len_to_capture
         self.max_logprobs = max_logprobs
         self.disable_sliding_window = disable_sliding_window
@@ -1554,6 +1556,54 @@ class SpeculativeConfig:
         num_spec_tokens = self.num_speculative_tokens
         return f"SpeculativeConfig({draft_model=}, {num_spec_tokens=})"
 
+class SystemPromptConfig:
+    """
+    sys_schema: a string be like "..aaaa...{__SYS_PROMPT}..bbbb..{__USR_PROMPT}..ccccc.."
+    """
+    def __init__(
+        self,
+        sys_prompt: Optional[str] = None,
+        sys_schema: Optional[str] = None,
+        sys_prompt_file: Optional[str] = None,
+        sys_schema_file: Optional[str] = None,
+    ) -> None:
+        self.prompt = sys_prompt
+        self.schema = sys_schema
+        # files have higher priority
+        if sys_prompt_file is not None:
+            with open(sys_prompt_file, "r") as file:
+               self.prompt = file.read()
+        if sys_schema_file is not None:
+            with open(sys_schema_file, "r") as file:
+               self.schema = file.read()
+        self.has_sys_prompt = False
+        if isinstance(self.prompt, str):
+            self.prompt = self.prompt.strip()
+            self.has_sys_prompt = len(self.prompt) > 0
+        if self.has_sys_prompt:
+            assert ( isinstance(self.schema, str)
+                and len(self.schema) > 0 )
+            substring = "{__USR_PROMPT}"
+            index = self.schema.find(substring)
+            assert index > 0
+            self.prefix_schema= self.schema[:index]
+            assert "{__SYS_PROMPT}" in  self.prefix_schema
+            self.request_schema = self.schema[index:]
+            assert self.request_schema.startswith(substring)
+        else:
+            self.prefix_schema = None
+            self.request_schema = None
+
+    def get_shared_prefix(self)->str:
+        return self.prefix_schema.format(__SYS_PROMPT=self.prompt)
+
+    def get_formatted_request(self, user_prompt:str, include_sys_prompt:bool)->str:
+        if include_sys_prompt:
+            formatted = self.schema.format(__SYS_PROMPT=self.prompt.strip(),
+                                           __USR_PROMPT=user_prompt.strip())
+        else:
+            formatted = self.request_schema.format(__USR_PROMPT=user_prompt.strip())
+        return formatted
 
 @dataclass
 class LoRAConfig:
@@ -1916,6 +1966,7 @@ class EngineConfig:
     decoding_config: Optional[DecodingConfig]
     observability_config: Optional[ObservabilityConfig]
     prompt_adapter_config: Optional[PromptAdapterConfig]
+    sys_prompt_config: Optional[SystemPromptConfig]
 
     def __post_init__(self):
         """Verify configs are valid & consistent with each other.

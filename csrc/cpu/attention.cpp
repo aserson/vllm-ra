@@ -419,10 +419,11 @@ void paged_attention_v1_impl_launcher(
 }  // namespace
 
 void paged_attention_v1(
-    torch::Tensor& out, torch::Tensor& query, torch::Tensor& key_cache,
-    torch::Tensor& value_cache, int64_t num_kv_heads, double scale,
-    torch::Tensor& block_tables, torch::Tensor& seq_lens, int64_t block_size,
-    int64_t max_seq_len, const c10::optional<torch::Tensor>& alibi_slopes,
+    torch::Tensor& lse, torch::Tensor& out, torch::Tensor& query,
+    torch::Tensor& key_cache, torch::Tensor& value_cache, int64_t num_kv_heads,
+    double scale, torch::Tensor& block_tables, torch::Tensor& seq_lens,
+    int64_t block_size, int64_t max_seq_len,
+    const c10::optional<torch::Tensor>& alibi_slopes,
     const std::string& kv_cache_dtype, double k_scale, double v_scale,
     const int64_t tp_rank, const int64_t blocksparse_local_blocks,
     const int64_t blocksparse_vert_stride, const int64_t blocksparse_block_size,
@@ -443,10 +444,9 @@ namespace {
 template <typename scalar_t, int HEAD_SIZE, int BLOCK_SIZE, int PARTITION_SIZE>
 struct paged_attention_v2_impl {
   static void call(
+      float* __restrict__ lse,
       scalar_t* __restrict__ out,            // [num_seqs, num_heads, head_size]
-      float* __restrict__ exp_sums,          // [num_seqs, num_heads,
-                                             // max_num_partitions]
-      float* __restrict__ max_logits,        // [num_seqs, num_heads,
+      float* __restrict__ tmp_lse,           // [num_seqs, num_heads,
                                              // max_num_partitions]
       scalar_t* __restrict__ tmp_out,        // [num_seqs, num_heads,
                                              // max_num_partitions, head_size]

@@ -183,8 +183,13 @@ def test_paged_attention(
 
     # Call the paged attention kernel.
     output = torch.empty_like(query)
+    lse = torch.empty(
+        size=(output.shape[0], output.shape[1]),
+        dtype=torch.float32,
+    )
     if version == "v1":
         ops.paged_attention_v1(
+            lse,
             output,
             query,
             key_cache,
@@ -202,7 +207,7 @@ def test_paged_attention(
         )
 
         opcheck(torch.ops._C.paged_attention_v1,
-                (output, query, key_cache, value_cache, num_kv_heads, scale,
+                (lse, output, query, key_cache, value_cache, num_kv_heads, scale,
                  block_tables, seq_lens, block_size, max_seq_len, alibi_slopes,
                  kv_cache_dtype, k_scale, v_scale, 0, 0, 0, 64, 0),
                 cond=(head_size == HEAD_SIZES[0]
@@ -212,20 +217,19 @@ def test_paged_attention(
         num_partitions = ((max_seq_len + PARTITION_SIZE - 1) // PARTITION_SIZE)
         assert PARTITION_SIZE % block_size == 0
         num_seqs, num_heads, head_size = output.shape
+        tmp_lse = torch.empty(
+            size=(num_seqs, num_heads, num_partitions),
+            dtype=torch.float32,
+        )
         tmp_output = torch.empty(
             size=(num_seqs, num_heads, num_partitions, head_size),
             dtype=output.dtype,
         )
-        exp_sums = torch.empty(
-            size=(num_seqs, num_heads, num_partitions),
-            dtype=torch.float32,
-        )
-        max_logits = torch.empty_like(exp_sums)
         if version == "v2":
             ops.paged_attention_v2(
+                lse,
                 output,
-                exp_sums,
-                max_logits,
+                tmp_lse,
                 tmp_output,
                 query,
                 key_cache,
@@ -243,7 +247,7 @@ def test_paged_attention(
             )
 
             opcheck(torch.ops._C.paged_attention_v2,
-                    (output, exp_sums, max_logits, tmp_output, query,
+                    (lse, output, tmp_lse, tmp_output, query,
                      key_cache, value_cache, num_kv_heads, scale, block_tables,
                      seq_lens, block_size, max_seq_len, alibi_slopes,
                      kv_cache_dtype, k_scale, v_scale, 0, 0, 0, 64, 0),
@@ -251,6 +255,11 @@ def test_paged_attention(
                           and block_size == BLOCK_SIZES[0]))
 
         else:
+            exp_sums = torch.empty(
+                size=(num_seqs, num_heads, num_partitions),
+                dtype=torch.float32,
+            )
+            max_logits = torch.empty_like(exp_sums)
             ops.paged_attention_rocm(
                 output,
                 exp_sums,

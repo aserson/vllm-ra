@@ -12,7 +12,8 @@ from vllm.config import (CacheConfig, ConfigFormat, DecodingConfig,
                          DeviceConfig, EngineConfig, LoadConfig, LoadFormat,
                          LoRAConfig, ModelConfig, ObservabilityConfig,
                          ParallelConfig, PromptAdapterConfig, SchedulerConfig,
-                         SpeculativeConfig, TaskOption, TokenizerPoolConfig)
+                         SpeculativeConfig, TaskOption, TokenizerPoolConfig,
+                         SystemPromptConfig)
 from vllm.executor.executor_base import ExecutorBase
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization import QUANTIZATION_METHODS
@@ -79,6 +80,19 @@ def nullable_kvs(val: str) -> Optional[Mapping[str, int]]:
 
     return out_dict
 
+def str2bool(v:str):
+    """
+    Converts string to bool type; enables command line
+    arguments in the format of '--arg1 true --arg2 false'
+    """
+    if isinstance(v, bool):
+        return v
+    if v.lower() in ('yes', 'true', 't', 'y', '1'):
+        return True
+    elif v.lower() in ('no', 'false', 'f', 'n', '0'):
+        return False
+    else:
+        raise argparse.ArgumentTypeError('Boolean value expected.')
 
 @dataclass
 class EngineArgs:
@@ -128,6 +142,13 @@ class EngineArgs:
     enforce_eager: Optional[bool] = None
     max_context_len_to_capture: Optional[int] = None
     max_seq_len_to_capture: int = 8192
+    # Relay attention and system prompt block
+    enable_relay_attention: bool = False
+    sys_prompt: Optional[str] = None
+    sys_schema: Optional[str] = None
+    sys_prompt_file: Optional[str] = None
+    sys_schema_file: Optional[str] = None
+    # End of block
     disable_custom_all_reduce: bool = False
     tokenizer_pool_size: int = 0
     # Note: Specifying a tokenizer pool by passing a class
@@ -850,6 +871,13 @@ class EngineArgs:
             'priority (lower value means earlier handling) and time of '
             'arrival deciding any ties).')
 
+        # Relay attention arguments
+        parser.add_argument('--enable-relay-attention', type=str2bool, default=False)
+        parser.add_argument('--sys-prompt', type=str, default=None)
+        parser.add_argument('--sys-schema', type=str, default=None)
+        parser.add_argument('--sys-prompt-file', type=str, default=None)
+        parser.add_argument('--sys-schema-file', type=str, default=None)
+
         return parser
 
     @classmethod
@@ -891,6 +919,7 @@ class EngineArgs:
             override_neuron_config=self.override_neuron_config,
             config_format=self.config_format,
             mm_processor_kwargs=self.mm_processor_kwargs,
+            enable_relay_attention=self.enable_relay_attention  # Relay attention
         )
 
     def create_load_config(self) -> LoadConfig:
@@ -1113,6 +1142,12 @@ class EngineArgs:
             or "all" in detailed_trace_modules,
         )
 
+        # System prompt configurations
+        sys_prompt_config = SystemPromptConfig(sys_prompt = self.sys_prompt,
+                                               sys_schema = self.sys_schema,
+                                               sys_prompt_file = self.sys_prompt_file,
+                                               sys_schema_file = self.sys_schema_file)
+
         return EngineConfig(
             model_config=model_config,
             cache_config=cache_config,
@@ -1125,6 +1160,7 @@ class EngineArgs:
             decoding_config=decoding_config,
             observability_config=observability_config,
             prompt_adapter_config=prompt_adapter_config,
+            sys_prompt_config=sys_prompt_config
         )
 
 
