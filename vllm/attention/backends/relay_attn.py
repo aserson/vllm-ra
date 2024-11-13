@@ -14,20 +14,11 @@ from vllm.attention.backends.abstract import (AttentionBackend, AttentionImpl,
                                               AttentionMetadata,
                                               AttentionMetadataBuilder,
                                               AttentionType)
-from vllm.attention.backends.utils import (PAD_SLOT_ID, CommonAttentionState,
-                                           compute_slot_mapping,
-                                           compute_slot_mapping_start_idx,
-                                           is_block_tables_empty)
+from vllm.attention.backends.utils import (CommonAttentionState,
+                                           CommonMetadataBuilder)
 from vllm.attention.backends.functional.flashattn_ops import flash_attn_with_kvcache
 from vllm.attention.backends.functional.relayattn_ops import relay_fusion
 from vllm.attention.backends.functional.xformers_ops import memory_efficient_attention_forward
-
-from vllm.forward_context import get_forward_context
-from vllm.utils import async_tensor_h2d, make_tensor_with_pad
-
-if TYPE_CHECKING:
-    from vllm.worker.model_runner import (ModelInputForGPUBuilder,
-                                          ModelInputForGPUWithSamplingMetadata)
 
 _PARTITION_SIZE = 512
 
@@ -104,10 +95,13 @@ class RelayAttentionMetadata(AttentionMetadata):
     # (batch_size,). The sequence length per sequence. Sequence length means
     # the computed tokens + new tokens None if it is a decoding.
     seq_lens: Optional[List[int]]
-    # seq_lens stored as a tensor.
-    seq_lens_tensor: Optional[torch.Tensor]
-    # Maximum query length in the batch.
-    max_query_len: Optional[int]
+
+    prefix_length: int
+    prefix_length_buffer: Optional[torch.Tensor]
+
+    # slot_mapping: torch.Tensor is in abstract class
+
+    attn_bias: Optional[List[AttentionBias]]
 
     # (batch_size, max_blocks_per_seq).
     # Block addresses per sequence. (Seq id -> list of physical block)
@@ -116,21 +110,43 @@ class RelayAttentionMetadata(AttentionMetadata):
     # 2nd dimensions are padded up to max_blocks_per_seq if it is cuda-graph
     # captured.
     block_tables: Optional[torch.Tensor]
+    # seq_lens stored as a tensor.
+    seq_lens_tensor: Optional[torch.Tensor]
 
-    is_prompt: bool
-    prefix_length: int
-    prefix_length_buffer: Optional[torch.Tensor]
+    # Maximum sequence length among prefill batch. 0 if there are decoding
+    # requests only.
+    max_prefill_seq_len: int
+    # Maximum sequence length among decode batch. 0 if there are prefill
+    # requests only.
+    max_decode_seq_len: int
+
+    # The data bellow used only for CommonMetadataBuilder
+
+    # Maximum query length in the batch. None for decoding.
+    max_query_len: Optional[int]
+
+    # (batch_size + 1,). The cumulative subquery lengths of the sequences in
+    # the batch, used to index into subquery. E.g., if the subquery length
+    # is [4, 6], it is [0, 4, 10].
+    query_start_loc: Optional[torch.Tensor]
+
+    # FIXME: It is for flash attn.
+    # (batch_size + 1,). The cumulative sequence lengths of the sequences in
+    # the batch, used to index into sequence. E.g., if the sequence length is
+    # [4, 6], it is [0, 4, 10].
+    seq_start_loc: Optional[torch.Tensor]
+
+    # (batch_size,) A tensor of context lengths (tokens that are computed
+    # so far).
+    context_lens_tensor: Optional[torch.Tensor]
+
+    # Whether or not if cuda graph is enabled.
+    # Cuda-graph is currently enabled for decoding only.
+    # TODO(woosuk): Move `use_cuda_graph` out since it's unrelated to attention.
+    use_cuda_graph: bool
 
     _cached_prefill_metadata: Optional["RelayAttentionMetadata"] = None
     _cached_decode_metadata: Optional["RelayAttentionMetadata"] = None
-
-    def __post_init__(self):
-        # Set during the execution of the first attention op.
-        # It is a list because it is needed to set per prompt
-        # when alibi slopes is used. It is because of the limitation
-        # from xformer API.
-        # will not appear in the __repr__ and __init__
-        self.attn_bias: Optional[List[AttentionBias]] = None
 
     @property
     def prefill_metadata(self) -> Optional["RelayAttentionMetadata"]:
@@ -142,19 +158,20 @@ class RelayAttentionMetadata(AttentionMetadata):
 
         assert self.seq_lens is not None
         assert self.seq_lens_tensor is not None
-        assert self.block_tables is not None
 
         self._cached_prefill_metadata = RelayAttentionMetadata(
             num_prefills=self.num_prefills,
             num_prefill_tokens=self.num_prefill_tokens,
             num_decode_tokens=0,
-            slot_mapping=self.slot_mapping[:self.num_prefill_tokens],
-            seq_lens=self.seq_lens[:self.num_prefills],
-            seq_lens_tensor=self.seq_lens_tensor[:self.num_prefills],
-            max_query_len=self.max_query_len,
-            block_tables=self.block_tables[:self.num_prefills],
-            prefix_length = 0,
-            prefix_length_buffer = None,
+            seq_lens=self.seq_lens,
+            prefix_length=0,
+            prefix_length_buffer=None,
+            slot_mapping=self.slot_mapping,
+            attn_bias=self.attn_bias,
+            block_tables=None,
+            seq_lens_tensor=None,
+            max_prefill_seq_len=self.max_prefill_seq_len,
+            max_decode_seq_len=0,
         )
         return self._cached_prefill_metadata
 
@@ -168,207 +185,28 @@ class RelayAttentionMetadata(AttentionMetadata):
         assert self.block_tables is not None
         assert self.seq_lens_tensor is not None
 
-        self._cached_decode_metadata = RelayAttentionMetadata(
+        seq_lens_tensor = self.seq_lens_tensor[self.num_prefills:]
+        block_tables = self.block_tables[self.num_prefills:]
+
+        self._cached_prefill_metadata = RelayAttentionMetadata(
             num_prefills=0,
             num_prefill_tokens=0,
             num_decode_tokens=self.num_decode_tokens,
-            slot_mapping=self.slot_mapping[self.num_prefill_tokens:],
-            seq_lens=None,
-            seq_lens_tensor=self.seq_lens_tensor[self.num_prefills:],
-            max_query_len=self.max_query_len,
-            block_tables=self.block_tables[self.num_prefills:],
-            prefix_length = 0,
-            prefix_length_buffer = None,
+            seq_lens=self.seq_lens,
+            prefix_length=0,
+            prefix_length_buffer=None,
+            slot_mapping=self.slot_mapping,
+            attn_bias=None,
+            block_tables=block_tables,
+            seq_lens_tensor=seq_lens_tensor,
+            max_prefill_seq_len=0,
+            max_decode_seq_len=self.max_decode_seq_len,
         )
         return self._cached_decode_metadata
 
 class RelayAttentionMetadataBuilder(
-        AttentionMetadataBuilder[RelayAttentionMetadata]):
-
-    def __init__(self, input_builder: "ModelInputForGPUBuilder"):
-        self.slot_mapping: List[int] = []
-        self.prefill_seq_lens: List[int] = []
-        self.context_lens: List[int] = []
-        self.block_tables: List[List[int]] = []
-        self.curr_seq_lens: List[int] = []
-        self.num_prefills = 0
-        self.num_prefill_tokens = 0
-        self.num_decode_tokens = 0
-        self.has_prefix_cache_hit = False
-
-        self.input_builder = input_builder
-        self.runner = input_builder.runner
-        self.sliding_window = input_builder.sliding_window
-        self.block_size = input_builder.block_size
-
-    def _add_seq_group(
-            self, inter_data: "ModelInputForGPUBuilder.InterDataForSeqGroup",
-            chunked_prefill_enabled: bool, prefix_cache_hit: bool):
-        """Add a sequence group to the metadata. Specifically update/append
-        1. context length.
-        2. block table.
-        3. slot mapping.
-        """
-        is_prompt = inter_data.is_prompt
-        block_tables = inter_data.block_tables
-
-        for (seq_id, token_len, seq_len, curr_seq_len, query_len, context_len,
-             curr_sliding_window_block) in zip(
-                 inter_data.seq_ids, [len(t) for t in inter_data.input_tokens],
-                 inter_data.orig_seq_lens, inter_data.seq_lens,
-                 inter_data.query_lens, inter_data.context_lens,
-                 inter_data.curr_sliding_window_blocks):
-            self.context_lens.append(context_len)
-
-            if is_prompt:
-                self.num_prefills += 1
-                self.num_prefill_tokens += token_len
-                self.prefill_seq_lens.append(seq_len)
-            else:
-                self.num_decode_tokens += query_len
-                self.curr_seq_lens.append(curr_seq_len)
-
-            # Compute block table.
-            # TODO(sang): Combine chunked prefill and prefix caching by
-            # only allowing multiple of block_size chunk size.
-            # NOTE: This only works for oooooooxxx style attention.
-            block_table = []
-            if prefix_cache_hit:
-                # NOTE(woosuk): For flash-attn, the block table should
-                # include the entries for the incoming prefill tokens.
-                block_table = block_tables[seq_id]
-            elif ((chunked_prefill_enabled or not is_prompt)
-                  and block_tables is not None):
-                if curr_sliding_window_block == 0:
-                    block_table = block_tables[seq_id]
-                else:
-                    block_table = block_tables[seq_id][
-                        -curr_sliding_window_block:]
-            self.block_tables.append(block_table)
-
-            # Compute slot mapping.
-            is_profile_run = is_block_tables_empty(block_tables)
-            start_idx = compute_slot_mapping_start_idx(is_prompt, query_len,
-                                                       context_len,
-                                                       self.sliding_window)
-            compute_slot_mapping(is_profile_run, self.slot_mapping, seq_id,
-                                 seq_len, context_len, start_idx,
-                                 self.block_size, inter_data.block_tables)
-
-    def _get_graph_runner_block_tables(
-            self, num_seqs: int,
-            block_tables: List[List[int]]) -> torch.Tensor:
-        # The shape of graph_block_tables is
-        # [max batch size, max context len // block size].
-        max_batch_size, max_blocks = self.runner.graph_block_tables.shape
-        assert max_batch_size >= num_seqs
-
-        graph_block_tables = self.runner.graph_block_tables[:num_seqs]
-        for i, block_table in enumerate(block_tables):
-            if block_table:
-                num_blocks = len(block_table)
-                if num_blocks <= max_blocks:
-                    graph_block_tables[i, :num_blocks] = block_table
-                else:
-                    # It may be possible to have more blocks allocated due
-                    # to lookahead slots of multi-step, however, they are
-                    # not used anyway, so can be safely ignored.
-                    graph_block_tables[
-                        i, :max_blocks] = block_table[:max_blocks]
-
-        return torch.from_numpy(graph_block_tables).to(
-            device=self.runner.device, non_blocking=True)
-
-    def build(self, seq_lens: List[int], query_lens: List[int],
-              cuda_graph_pad_size: int, batch_size: int):
-        """Build attention metadata with on-device tensors.
-
-        Args:
-            seq_lens: The maybe padded sequence lengths of the input sequences.
-            query_lens: The query lengths of the input sequences.
-            cuda_graph_pad_size: The padding size for cuda graph.
-                                 -1 if cuda graph is not used.
-            batch_size: The maybe padded batch size.
-        """
-        prefix_cache_hit = any([
-            inter_data.prefix_cache_hit
-            for inter_data in self.input_builder.inter_data_list
-        ])
-        for inter_data in self.input_builder.inter_data_list:
-            self._add_seq_group(inter_data,
-                                self.input_builder.chunked_prefill_enabled,
-                                prefix_cache_hit)
-
-        device = self.runner.device
-        use_captured_graph = cuda_graph_pad_size != -1
-
-        max_query_len = max(query_lens)
-        decode_query_lens = query_lens[self.num_prefills:]
-        if len(decode_query_lens) > 0:
-            max_decode_query_len = max(decode_query_lens)
-        else:
-            max_decode_query_len = 1
-        max_prefill_seq_len = max(self.prefill_seq_lens, default=0)
-        max_decode_seq_len = max(self.curr_seq_lens, default=0)
-        num_decode_tokens = self.num_decode_tokens
-
-        num_seqs = len(seq_lens)
-        if use_captured_graph:
-            self.slot_mapping.extend([PAD_SLOT_ID] * cuda_graph_pad_size)
-            self.block_tables.extend([] * cuda_graph_pad_size)
-            num_decode_tokens = batch_size - self.num_prefill_tokens
-            block_tables = self._get_graph_runner_block_tables(
-                num_seqs, self.block_tables)
-        else:
-            block_tables = make_tensor_with_pad(
-                self.block_tables,
-                pad=0,
-                dtype=torch.int,
-                device=device,
-            )
-        assert max_query_len > 0, ("query_lens: {}".format(query_lens))
-
-        assert device is not None
-        context_lens_tensor = async_tensor_h2d(self.context_lens, torch.int,
-                                               device, self.runner.pin_memory)
-        seq_lens_tensor = async_tensor_h2d(seq_lens, torch.int, device,
-                                           self.runner.pin_memory)
-        query_lens_tensor = async_tensor_h2d(query_lens, torch.long, device,
-                                             self.runner.pin_memory)
-        slot_mapping_tensor = async_tensor_h2d(self.slot_mapping, torch.long,
-                                               device, self.runner.pin_memory)
-        query_start_loc = torch.zeros(query_lens_tensor.shape[0] + 1,
-                                      dtype=torch.int32,
-                                      device=device)
-        seq_start_loc = torch.zeros(seq_lens_tensor.shape[0] + 1,
-                                    dtype=torch.int32,
-                                    device=device)
-        torch.cumsum(seq_lens_tensor,
-                     dim=0,
-                     dtype=seq_start_loc.dtype,
-                     out=seq_start_loc[1:])
-        torch.cumsum(query_lens_tensor,
-                     dim=0,
-                     dtype=query_start_loc.dtype,
-                     out=query_start_loc[1:])
-
-        return RelayAttentionMetadata(
-            num_prefills=self.num_prefills,
-            slot_mapping=slot_mapping_tensor,
-            num_prefill_tokens=self.num_prefill_tokens,
-            num_decode_tokens=num_decode_tokens,
-            seq_lens=seq_lens,
-            seq_lens_tensor=seq_lens_tensor,
-            max_query_len=max_query_len,
-            max_decode_query_len=max_decode_query_len,
-            max_prefill_seq_len=max_prefill_seq_len,
-            max_decode_seq_len=max_decode_seq_len,
-            query_start_loc=query_start_loc,
-            seq_start_loc=seq_start_loc,
-            context_lens_tensor=context_lens_tensor,
-            block_tables=block_tables,
-            use_cuda_graph=use_captured_graph,
-        )
+        CommonMetadataBuilder[RelayAttentionMetadata]):
+    _metadata_cls = RelayAttentionMetadata
 
 
 class RelayAttentionImpl(AttentionImpl):
@@ -437,15 +275,16 @@ class RelayAttentionImpl(AttentionImpl):
             shape = [num_tokens, num_heads * head_size]
         """
 
-        # fill the prefix kv cache here
-        # NOTE: this happens only when we fill prefix kv cache
-        # by passing input_metadata.prefix_length=-1 as the signal
-        if attn_metadata.prefix_length < 0:
-            assert (kv_cache is None) and (prefix_kv_cache is not None)
-            assert attn_metadata.is_prompt and (len(attn_metadata.seq_lens) == 1)
-            seq_len = attn_metadata.seq_lens[0]
-            prefix_kv_cache[0, :, :seq_len, :, :] = key.unflatten(-1, (self.num_kv_heads, self.head_size))
-            prefix_kv_cache[1, :, :seq_len, :, :] = value.unflatten(-1, (self.num_kv_heads, self.head_size))
+        if prefill_meta := attn_metadata.prefill_metadata:
+            # fill the prefix kv cache here
+            # NOTE: this happens only when we fill prefix kv cache
+            # by passing input_metadata.prefix_length=-1 as the signal
+            if prefill_meta.prefix_length < 0:
+                assert (kv_cache is None) and (prefix_kv_cache is not None)
+                assert (len(prefill_meta.seq_lens) == 1)
+                seq_len = prefill_meta.seq_lens[0]
+                prefix_kv_cache[0, :, :seq_len, :, :] = key.unflatten(-1, (self.num_kv_heads, self.head_size))
+                prefix_kv_cache[1, :, :seq_len, :, :] = value.unflatten(-1, (self.num_kv_heads, self.head_size))
 
         if attn_metadata.prefix_length > 0:
             # FIXME (ray): window attention
@@ -479,7 +318,7 @@ class RelayAttentionImpl(AttentionImpl):
                 v_scale,
             )
 
-        if attn_metadata.is_prompt:
+        if prefill_meta := attn_metadata.prefill_metadata:
             # Prompt run.
             if self.num_kv_heads != self.num_heads:
                 # As of Nov 2023, xformers only supports MHA. For MQA/GQA,
@@ -506,13 +345,13 @@ class RelayAttentionImpl(AttentionImpl):
             # Set attention bias if not provided. This typically happens at the
             # very attention layer of every iteration.
             # FIXME(woosuk): This is a hack.
-            if attn_metadata.attn_bias is None:
+            if prefill_meta.attn_bias is None:
                 attn_bias = BlockDiagonalCausalMask.from_seqlens(
-                    attn_metadata.seq_lens)
+                    prefill_meta.seq_lens)
                 if self.sliding_window is not None:
                     attn_bias = attn_bias.make_local_attention(
                         self.sliding_window)
-                attn_metadata.attn_bias = attn_bias
+                prefill_meta.attn_bias = attn_bias
 
             # [1, bsz*seqlen, head_groups, num_heads_per_group, K]
             query = query.unsqueeze(0)
@@ -522,13 +361,14 @@ class RelayAttentionImpl(AttentionImpl):
             out, lse = memory_efficient_attention_forward(query,
                                                           key,
                                                           value,
-                                                          attn_bias=attn_metadata.attn_bias,
+                                                          attn_bias=prefill_meta.attn_bias,
                                                           p=0.0,
                                                           scale=self.scale)
             output = out.view(num_tokens, self.num_heads, self.head_size)
             # (bsz, head, num_queries) -> (bsz*num_queries, nheads)
             lse = lse.transpose(1, 2).reshape(num_tokens, self.num_heads).contiguous()
-        else:
+
+        if decode_meta := attn_metadata.decode_metadata:
             # Decoding run.
             if kv_cache is not None:
                 # (bsz*seqlen, nheads, head_size)
@@ -537,9 +377,9 @@ class RelayAttentionImpl(AttentionImpl):
                     query,
                     kv_cache[0],
                     kv_cache[1],
-                    attn_metadata.block_tables,
-                    attn_metadata.seq_lens_tensor,
-                    attn_metadata.max_decode_seq_len,
+                    decode_meta.block_tables,
+                    decode_meta.seq_lens_tensor,
+                    decode_meta.max_decode_seq_len,
                     self.kv_cache_dtype,
                     self.num_kv_heads,
                     self.scale,
