@@ -39,7 +39,7 @@ def _memory_efficient_attention_forward(
         _ensure_op_supports_or_raise(ValueError, "memory_efficient_attention", op, inp)
     
     # FIXME: the dispatched operator may possibly not return lse 
-    out, context = op.apply(inp, needs_gradient=False)
+    out, context = op.apply(inp, needs_gradient=True)
     assert isinstance(context, Context)
     lse = context.lse # (bsz, head, num_queries)
     return out.reshape(output_shape), lse

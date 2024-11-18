@@ -492,7 +492,7 @@ class LLMEngine:
 
         # allocate the system KV cache first to allow precise memory usage profiling
         # TODO: move this call into executor classes
-        self.model_executor._run_workers("init_prefix_cache")
+        # self.model_executor._run_workers("init_prefix_cache")
 
         num_gpu_blocks, num_cpu_blocks = (
             self.model_executor.determine_num_available_blocks())

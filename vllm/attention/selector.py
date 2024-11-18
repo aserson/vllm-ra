@@ -25,6 +25,7 @@ class _Backend(enum.Enum):
     FLASHINFER = enum.auto()
     PALLAS = enum.auto()
     IPEX = enum.auto()
+    RELAY_ATTN = enum.auto()
     NO_ATTENTION = enum.auto()
 
 
@@ -149,6 +150,10 @@ def get_attn_backend(
         logger.info("Using Pallas backend.")
         from vllm.attention.backends.pallas import PallasAttentionBackend
         return PallasAttentionBackend
+    elif backend == _Backend.RELAY_ATTN:
+        logger.info("Using RelayAttention backend.")
+        from vllm.attention.backends.relay_attn import RelayAttentionBackend
+        return RelayAttentionBackend
     elif backend == _Backend.NO_ATTENTION:
         from vllm.attention.backends.placeholder_attn import (
             PlaceholderAttentionBackend)
@@ -163,6 +168,7 @@ def which_attn_to_use(
     kv_cache_dtype: Optional[str],
     block_size: int,
     is_attention_free: bool,
+    is_relay_attention: Optional[bool] = False
 ) -> _Backend:
     """Returns which flash attention backend to use."""
     # Default case.
@@ -172,6 +178,9 @@ def which_attn_to_use(
     # use the placeholder NO_ATTENTION
     if is_attention_free:
         return _Backend.NO_ATTENTION
+
+    if is_relay_attention:
+        return _Backend.RELAY_ATTN
 
     # Check whether a particular choice of backend was
     # previously forced.

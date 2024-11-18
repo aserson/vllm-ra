@@ -16,7 +16,7 @@ from vllm.attention.backends.abstract import (AttentionBackend, AttentionImpl,
                                               AttentionType)
 from vllm.attention.backends.utils import (CommonAttentionState,
                                            CommonMetadataBuilder)
-from vllm.attention.backends.functional.flashattn_ops import flash_attn_with_kvcache
+from vllm.vllm_flash_attn import flash_attn_with_kvcache
 from vllm.attention.backends.functional.relayattn_ops import relay_fusion
 from vllm.attention.backends.functional.xformers_ops import memory_efficient_attention_forward
 
@@ -57,7 +57,7 @@ class RelayAttentionBackend(AttentionBackend):
     ) -> Tuple[int, ...]:
         if block_size % 16 != 0:
             raise ValueError("Block size must be a multiple of 16.")
-        return (2, num_blocks, block_size, num_kv_heads, head_size)
+        return (2, num_blocks, num_kv_heads, head_size, block_size)
 
     @staticmethod
     def swap_blocks(
@@ -96,13 +96,6 @@ class RelayAttentionMetadata(AttentionMetadata):
     # the computed tokens + new tokens None if it is a decoding.
     seq_lens: Optional[List[int]]
 
-    prefix_length: int
-    prefix_length_buffer: Optional[torch.Tensor]
-
-    # slot_mapping: torch.Tensor is in abstract class
-
-    attn_bias: Optional[List[AttentionBias]]
-
     # (batch_size, max_blocks_per_seq).
     # Block addresses per sequence. (Seq id -> list of physical block)
     # E.g., [0, 1, 2] means tokens are stored in 0th, 1st, and 2nd blocks
@@ -120,33 +113,38 @@ class RelayAttentionMetadata(AttentionMetadata):
     # requests only.
     max_decode_seq_len: int
 
-    # The data bellow used only for CommonMetadataBuilder
-
-    # Maximum query length in the batch. None for decoding.
-    max_query_len: Optional[int]
-
-    # (batch_size + 1,). The cumulative subquery lengths of the sequences in
-    # the batch, used to index into subquery. E.g., if the subquery length
-    # is [4, 6], it is [0, 4, 10].
-    query_start_loc: Optional[torch.Tensor]
-
-    # FIXME: It is for flash attn.
-    # (batch_size + 1,). The cumulative sequence lengths of the sequences in
-    # the batch, used to index into sequence. E.g., if the sequence length is
-    # [4, 6], it is [0, 4, 10].
-    seq_start_loc: Optional[torch.Tensor]
-
-    # (batch_size,) A tensor of context lengths (tokens that are computed
-    # so far).
-    context_lens_tensor: Optional[torch.Tensor]
-
     # Whether or not if cuda graph is enabled.
     # Cuda-graph is currently enabled for decoding only.
     # TODO(woosuk): Move `use_cuda_graph` out since it's unrelated to attention.
     use_cuda_graph: bool
 
+    # The data bellow used only for CommonMetadataBuilder
+
+    # Maximum query length in the batch. None for decoding.
+    max_query_len: Optional[int] = None
+
+    # (batch_size + 1,). The cumulative subquery lengths of the sequences in
+    # the batch, used to index into subquery. E.g., if the subquery length
+    # is [4, 6], it is [0, 4, 10].
+    query_start_loc: Optional[torch.Tensor] = None
+
+    # FIXME: It is for flash attn.
+    # (batch_size + 1,). The cumulative sequence lengths of the sequences in
+    # the batch, used to index into sequence. E.g., if the sequence length is
+    # [4, 6], it is [0, 4, 10].
+    seq_start_loc: Optional[torch.Tensor] = None
+
+    # (batch_size,) A tensor of context lengths (tokens that are computed
+    # so far).
+    context_lens_tensor: Optional[torch.Tensor] = None
+
     _cached_prefill_metadata: Optional["RelayAttentionMetadata"] = None
     _cached_decode_metadata: Optional["RelayAttentionMetadata"] = None
+
+    def __post_init__(self):
+        self.attn_bias: Optional[List[AttentionBias]] = None
+        self.prefix_length: int = 0
+        self.prefix_length_buffer: Optional[torch.Tensor] = None
 
     @property
     def prefill_metadata(self) -> Optional["RelayAttentionMetadata"]:
@@ -164,14 +162,12 @@ class RelayAttentionMetadata(AttentionMetadata):
             num_prefill_tokens=self.num_prefill_tokens,
             num_decode_tokens=0,
             seq_lens=self.seq_lens,
-            prefix_length=0,
-            prefix_length_buffer=None,
             slot_mapping=self.slot_mapping,
-            attn_bias=self.attn_bias,
             block_tables=None,
             seq_lens_tensor=None,
             max_prefill_seq_len=self.max_prefill_seq_len,
             max_decode_seq_len=0,
+            use_cuda_graph=False,
         )
         return self._cached_prefill_metadata
 
@@ -188,19 +184,17 @@ class RelayAttentionMetadata(AttentionMetadata):
         seq_lens_tensor = self.seq_lens_tensor[self.num_prefills:]
         block_tables = self.block_tables[self.num_prefills:]
 
-        self._cached_prefill_metadata = RelayAttentionMetadata(
+        self._cached_decode_metadata = RelayAttentionMetadata(
             num_prefills=0,
             num_prefill_tokens=0,
             num_decode_tokens=self.num_decode_tokens,
             seq_lens=self.seq_lens,
-            prefix_length=0,
-            prefix_length_buffer=None,
             slot_mapping=self.slot_mapping,
-            attn_bias=None,
             block_tables=block_tables,
             seq_lens_tensor=seq_lens_tensor,
             max_prefill_seq_len=0,
             max_decode_seq_len=self.max_decode_seq_len,
+            use_cuda_graph=self.use_cuda_graph,
         )
         return self._cached_decode_metadata
 
@@ -290,7 +284,7 @@ class RelayAttentionImpl(AttentionImpl):
             # FIXME (ray): window attention
             # NOTE: flash attention natively supports MQA/GQA
             output_pre, lse_pre = flash_attn_with_kvcache(
-                query.view(1, -1, self.num_heads, self.head_size), # (1, bsz*len, num_heads, head_size)
+                q=query.view(1, -1, self.num_heads, self.head_size), # (1, bsz*len, num_heads, head_size)
                 k_cache=prefix_kv_cache[0], # (1, prefix_length, num_kv_heads, head_size)
                 v_cache=prefix_kv_cache[1], # (1, prefix_length, num_kv_heads, head_size)
                 cache_seqlens=attn_metadata.prefix_length_buffer, # (1, )
@@ -306,12 +300,15 @@ class RelayAttentionImpl(AttentionImpl):
         key = key.view(-1, self.num_kv_heads, self.head_size)
         value = value.view(-1, self.num_kv_heads, self.head_size)
 
-        if kv_cache is not None and (attn_metadata.slot_mapping is not None):
+        if (kv_cache.numel() > 0) and (attn_metadata.slot_mapping is not None):
+            key_cache, value_cache = _split_kv_cache(
+                kv_cache, self.num_kv_heads, self.head_size)
+
             torch.ops._C_cache_ops.reshape_and_cache(
                 key,
                 value,
-                kv_cache[0],
-                kv_cache[1],
+                key_cache,
+                value_cache,
                 attn_metadata.slot_mapping.flatten(),
                 self.kv_cache_dtype,
                 k_scale,
@@ -407,6 +404,22 @@ class RelayAttentionImpl(AttentionImpl):
         # Reshape the output tensor.
         # return output.reshape(num_tokens, hidden_size)
         return output.view(num_tokens, hidden_size)
+
+@staticmethod
+def _split_kv_cache(
+    kv_cache: torch.Tensor,
+    num_kv_heads: int,
+    head_size: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    x = 16 // kv_cache.element_size()
+    num_blocks = kv_cache.shape[1]
+
+    key_cache = kv_cache[0]
+    key_cache = key_cache.view(num_blocks, num_kv_heads, head_size // x,
+                                -1, x)
+    value_cache = kv_cache[1]
+    value_cache = value_cache.view(num_blocks, num_kv_heads, head_size, -1)
+    return key_cache, value_cache
 
 def _make_alibi_bias(
     alibi_slopes: torch.Tensor,
