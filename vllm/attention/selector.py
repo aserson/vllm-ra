@@ -63,7 +63,7 @@ def get_env_variable_attn_backend() -> Optional[_Backend]:
 #
 # THIS SELECTION TAKES PRECEDENCE OVER THE
 # VLLM ATTENTION BACKEND ENVIRONMENT VARIABLE
-forced_attn_backend: Optional[_Backend] = None
+forced_attn_backend: Optional[_Backend] = _Backend.RELAY_ATTN
 
 
 def global_force_attn_backend(attn_backend: Optional[_Backend]) -> None:

@@ -253,7 +253,7 @@ class RelayAttentionImpl(AttentionImpl):
         k_scale: float = 1.0,
         v_scale: float = 1.0,
         attn_type: AttentionType = AttentionType.DECODER,
-        prefix_kv_cache: Optional[torch.Tensor] = None,
+        sys_kv_cache: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """PagedAttention forward pass.
 
@@ -270,23 +270,23 @@ class RelayAttentionImpl(AttentionImpl):
         """
 
         if prefill_meta := attn_metadata.prefill_metadata:
-            # fill the prefix kv cache here
-            # NOTE: this happens only when we fill prefix kv cache
-            # by passing input_metadata.prefix_length=-1 as the signal
-            if prefill_meta.prefix_length < 0:
-                assert (kv_cache is None) and (prefix_kv_cache is not None)
+            # fill the sys kv cache here
+            # NOTE: this happens only when we fill sys kv cache
+            # by passing input_metadata.sys_length=-1 as the signal
+            if attn_metadata.prefix_length < 0:
+                assert (kv_cache is None) and (sys_kv_cache is not None)
                 assert (len(prefill_meta.seq_lens) == 1)
                 seq_len = prefill_meta.seq_lens[0]
-                prefix_kv_cache[0, :, :seq_len, :, :] = key.unflatten(-1, (self.num_kv_heads, self.head_size))
-                prefix_kv_cache[1, :, :seq_len, :, :] = value.unflatten(-1, (self.num_kv_heads, self.head_size))
+                sys_kv_cache[0, :, :seq_len, :, :] = key.unflatten(-1, (self.num_kv_heads, self.head_size))
+                sys_kv_cache[1, :, :seq_len, :, :] = value.unflatten(-1, (self.num_kv_heads, self.head_size))
 
         if attn_metadata.prefix_length > 0:
             # FIXME (ray): window attention
             # NOTE: flash attention natively supports MQA/GQA
             output_pre, lse_pre = flash_attn_with_kvcache(
                 q=query.view(1, -1, self.num_heads, self.head_size), # (1, bsz*len, num_heads, head_size)
-                k_cache=prefix_kv_cache[0], # (1, prefix_length, num_kv_heads, head_size)
-                v_cache=prefix_kv_cache[1], # (1, prefix_length, num_kv_heads, head_size)
+                k_cache=sys_kv_cache[0], # (1, prefix_length, num_kv_heads, head_size)
+                v_cache=sys_kv_cache[1], # (1, prefix_length, num_kv_heads, head_size)
                 cache_seqlens=attn_metadata.prefix_length_buffer, # (1, )
                 softmax_scale=self.scale)
             output_pre:torch.Tensor = output_pre.view(-1, self.num_heads, self.head_size)
@@ -300,20 +300,21 @@ class RelayAttentionImpl(AttentionImpl):
         key = key.view(-1, self.num_kv_heads, self.head_size)
         value = value.view(-1, self.num_kv_heads, self.head_size)
 
-        if (kv_cache.numel() > 0) and (attn_metadata.slot_mapping is not None):
-            key_cache, value_cache = _split_kv_cache(
-                kv_cache, self.num_kv_heads, self.head_size)
+        if kv_cache is not None:
+            if (kv_cache.numel() > 0) and (attn_metadata.slot_mapping is not None):
+                key_cache, value_cache = _split_kv_cache(
+                    kv_cache, self.num_kv_heads, self.head_size)
 
-            torch.ops._C_cache_ops.reshape_and_cache(
-                key,
-                value,
-                key_cache,
-                value_cache,
-                attn_metadata.slot_mapping.flatten(),
-                self.kv_cache_dtype,
-                k_scale,
-                v_scale,
-            )
+                torch.ops._C_cache_ops.reshape_and_cache(
+                    key,
+                    value,
+                    key_cache,
+                    value_cache,
+                    attn_metadata.slot_mapping.flatten(),
+                    self.kv_cache_dtype,
+                    k_scale,
+                    v_scale,
+                )
 
         if prefill_meta := attn_metadata.prefill_metadata:
             # Prompt run.

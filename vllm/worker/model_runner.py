@@ -1050,6 +1050,8 @@ class GPUModelRunnerBase(ModelRunnerBase[TModelInputForGPU]):
         self.sampling_metadata_cache: SamplingMetadataCache = \
               SamplingMetadataCache() \
                 if self.parallel_config.pipeline_parallel_size == 1 else None
+        
+        self.sys_prompt_length: int = 0
 
     def load_model(self) -> None:
         logger.info("Starting to load model %s...", self.model_config.model)
@@ -1304,6 +1306,112 @@ class GPUModelRunnerBase(ModelRunnerBase[TModelInputForGPU]):
             self.execute_model(model_input, kv_caches, intermediate_tensors)
         torch.cuda.synchronize()
         return
+
+    @torch.inference_mode()
+    def fill_sys_kv_cache(self, sys_token_ids:List[int],
+            sys_kv_caches:List[Tuple[torch.Tensor, torch.Tensor]])->None:
+        # Enable top-k sampling to reflect the accurate memory usage.
+        sampling_params = SamplingParams(top_p=0.99, top_k=self.vocab_size - 1)
+        max_num_batched_tokens = self.scheduler_config.max_num_batched_tokens
+        max_num_seqs = self.scheduler_config.max_num_seqs
+
+        # Profile memory usage with max_num_sequences sequences and the total
+        # number of tokens equal to max_num_batched_tokens.
+        seqs: List[SequenceGroupMetadata] = []
+        # Additional GPU memory may be needed for multi-modal encoding, which
+        # needs to be accounted for when calculating the GPU blocks for
+        # vLLM blocker manager.
+        # To exercise the worst scenario for GPU memory consumption,
+        # the number of seqs (batch_size) is chosen to maximize the number
+        # of images processed.
+
+        batch_size = 0
+        seq_len = max_num_batched_tokens
+        batch_size = seq_len
+
+        seq_data, dummy_multi_modal_data = self.input_registry \
+                .dummy_data_for_profiling(self.model_config,
+                                          seq_len,
+                                          self.mm_registry)
+        
+        seq = SequenceGroupMetadata(
+                request_id=str(0),
+                is_prompt=True,
+                seq_data={0: seq_data},
+                sampling_params=sampling_params,
+                block_tables=None,
+            )
+        
+        seqs.append(seq)
+
+        # Run the model with the dummy inputs.
+        num_layers = self.model_config.get_num_layers(self.parallel_config)
+        
+        kv_caches = [
+            None
+            for _ in range(num_layers)
+        ]
+        finished_requests_ids = [seq.request_id for seq in seqs]
+        self.sys_prompt_length = -1
+        model_input = self.prepare_model_input(
+            seqs, finished_requests_ids=finished_requests_ids)
+        model_input.attn_metadata.prefix_length = -1
+            
+        # self.execute_model(model_input, kv_caches, None, sys_kv_caches=sys_kv_caches)
+
+        _sys_length = len(sys_token_ids)
+
+        assert _sys_length > 0
+        assert len(sys_kv_caches) == num_layers
+        assert sys_kv_caches[0][0] is not None
+
+        input_tokens = torch.tensor(
+            [sys_token_ids],
+            dtype=torch.long, device="cuda") # (1, prefix_len)
+        input_positions = torch.tensor(
+            [list(range(_sys_length))],
+            dtype=torch.long, device="cuda") # (1, prefix_len)
+
+        self.model(input_ids=input_tokens,
+                positions=input_positions,
+                kv_caches=kv_caches,
+                attn_metadata=model_input.attn_metadata,
+                intermediate_tensors=None,
+                sys_kv_caches=sys_kv_caches)
+
+        # _prefix_length = len(prefix_token_ids)
+        # num_layers = self.model_config.get_num_layers(self.parallel_config)
+        # assert _prefix_length > 0
+        # assert (len(prefix_kv_caches) == num_layers) and \
+        #         (prefix_kv_caches[0][0] is not None)
+        # # construct input data
+        # input_tokens = torch.tensor(
+        #     [prefix_token_ids],
+        #     dtype=torch.long, device="cuda") # (1, prefix_len)
+        # input_positions = torch.tensor(
+        #     [list(range(_prefix_length))],
+        #     dtype=torch.long, device="cuda") # (1, prefix_len)
+        # input_metadata = InputMetadata(
+        #     prompt_lens=[_prefix_length],
+        #     slot_mapping=None, # no need to fill paged kv cache
+        #     max_context_len=None, # PagedAttention is not ativcated
+        #     context_lens=None, # PagedAttention is not ativcated
+        #     block_tables=None, # PagedAttention is not ativcated
+        #     use_cuda_graph=False, # cuda graph is used for generation phase only
+        #     prefix_length=-1, # use -1 to notify this is prefix kv cache filling 
+        #     prefix_length_buffer=None, # no need to run relay at the filling stage
+        # )
+        # # this forward is for prefix kv cache filling only
+        # # no need to do sampling
+        # _ = self.model(
+        #     input_ids=input_tokens,
+        #     positions=input_positions,
+        #     kv_caches=[(None, None)] * num_layers,
+        #     input_metadata=input_metadata,
+        #     prefix_kv_caches=prefix_kv_caches
+        # )
+        # # record the prefix length
+        # self.prefix_len = _prefix_length
 
     def remove_all_loras(self):
         if not self.lora_manager:
@@ -1608,6 +1716,7 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
         kv_caches: List[torch.Tensor],
         intermediate_tensors: Optional[IntermediateTensors] = None,
         num_steps: int = 1,
+        sys_kv_caches: Optional[List[torch.Tensor]] = None,
     ) -> Optional[Union[List[SamplerOutput], IntermediateTensors]]:
         if num_steps > 1:
             raise ValueError("num_steps > 1 is not supported in ModelRunner")
@@ -1660,6 +1769,7 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
                 kv_caches=kv_caches,
                 attn_metadata=model_input.attn_metadata,
                 intermediate_tensors=intermediate_tensors,
+                sys_kv_caches=sys_kv_caches,
                 **MultiModalInputs.as_kwargs(multi_modal_kwargs,
                                              device=self.device),
                 **seqlen_agnostic_kwargs)
