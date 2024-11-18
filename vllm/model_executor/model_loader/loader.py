@@ -152,7 +152,8 @@ def build_model(model_class: Type[nn.Module], hf_config: PretrainedConfig,
                 quant_config: Optional[QuantizationConfig], *,
                 lora_config: Optional[LoRAConfig],
                 multimodal_config: Optional[MultiModalConfig],
-                scheduler_config: Optional[SchedulerConfig]) -> nn.Module:
+                scheduler_config: Optional[SchedulerConfig],
+                is_relay_attention: Optional[bool]) -> nn.Module:
     extra_kwargs = _get_model_initialization_kwargs(model_class, lora_config,
                                                     multimodal_config,
                                                     scheduler_config)
@@ -160,6 +161,7 @@ def build_model(model_class: Type[nn.Module], hf_config: PretrainedConfig,
     return model_class(config=hf_config,
                        cache_config=cache_config,
                        quant_config=quant_config,
+                       is_relay_attention=is_relay_attention,
                        **extra_kwargs)
 
 
@@ -180,6 +182,7 @@ def _initialize_model(
         lora_config=lora_config,
         multimodal_config=model_config.multimodal_config,
         scheduler_config=scheduler_config,
+        is_relay_attention=model_config.enable_relay_attention,
     )
 
 

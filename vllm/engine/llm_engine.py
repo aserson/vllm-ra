@@ -489,10 +489,7 @@ class LLMEngine:
         The workers will determine the number of blocks in both the GPU cache
         and the swap CPU cache.
         """
-
-        # allocate the system KV cache first to allow precise memory usage profiling
-        # TODO: move this call into executor classes
-        # self.model_executor._run_workers("init_prefix_cache")
+        self.model_executor.initialize_sys_cache()
 
         num_gpu_blocks, num_cpu_blocks = (
             self.model_executor.determine_num_available_blocks())
@@ -513,8 +510,8 @@ class LLMEngine:
         # TODO: move this call into executor classes
         if self.model_config.enable_relay_attention:
             if self.sys_prompt_config.has_sys_prompt:
-                self.fill_prefix_kv_cache(
-                    shared_prefix=self.sys_prompt_config.get_shared_prefix())
+                self.fill_sys_kv_cache(
+                    system_prompt=self.sys_prompt_config.get_shared_prefix())
             else:
                 logger.warning("Though enable_relay_attention is set as true, "
                                "relay attention is not activated due to no system "
@@ -656,17 +653,17 @@ class LLMEngine:
             self.prompt_adapter_config.verify_with_model_config(
                 self.model_config)
 
-    def fill_prefix_kv_cache(self, shared_prefix:str,
-                             shared_prefix_toks:Optional[List[int]]=None):
-        if shared_prefix_toks is None:
-            assert isinstance(shared_prefix, str)
-            shared_prefix_tokenized = self.tokenizer.encode(shared_prefix)
+    def fill_sys_kv_cache(self, system_prompt:str,
+                             system_prompt_toks:Optional[List[int]]=None):
+        if system_prompt_toks is None:
+            assert isinstance(system_prompt, str)
+            system_prompt_tokenized = self.tokenizer.encode(system_prompt)
         else:
-            assert shared_prefix is None
-            shared_prefix_tokenized = shared_prefix_toks
+            assert system_prompt is None
+            system_prompt_tokenized = system_prompt_toks
         # TODO (ray): we may need to set the tokenizer to not prepend <bos> token for later requests
-        logger.info(f'Filling the shared prefix kv cache with {len(shared_prefix_tokenized)} tokens.')
-        self.model_executor._run_workers('fill_prefix_kv_cache', prefix_token_ids=shared_prefix_tokenized)
+        logger.info(f'Filling the shared system prompt kv cache with {len(system_prompt_tokenized)} tokens.')
+        self.model_executor.fill_sys_kv_cache(sys_token_ids=system_prompt_tokenized)
 
     def _add_processed_request(
         self,

@@ -1015,6 +1015,7 @@ class GPUModelRunnerBase(ModelRunnerBase[TModelInputForGPU]):
             self.kv_cache_dtype,
             self.block_size,
             self.model_config.is_attention_free,
+            is_relay_attention=self.model_config.enable_relay_attention
         ) if needs_attn_backend else None
         if self.attn_backend:
             self.attn_state = self.attn_backend.get_state_cls()(
@@ -1304,6 +1305,60 @@ class GPUModelRunnerBase(ModelRunnerBase[TModelInputForGPU]):
             self.execute_model(model_input, kv_caches, intermediate_tensors)
         torch.cuda.synchronize()
         return
+
+    @torch.inference_mode()
+    def fill_sys_kv_cache(self, sys_token_ids:List[int],
+            sys_kv_caches:List[Tuple[torch.Tensor, torch.Tensor]])->None:
+        # Enable top-k sampling to reflect the accurate memory usage.
+        sampling_params = SamplingParams(top_p=0.99, top_k=self.vocab_size - 1)
+
+        _sys_length = len(sys_token_ids)
+
+        seq_data, _ = self.input_registry \
+                .dummy_data_for_profiling(self.model_config,
+                                          _sys_length,
+                                          self.mm_registry)
+
+        seq = SequenceGroupMetadata(
+                request_id=str(0),
+                is_prompt=True,
+                seq_data={0: seq_data},
+                sampling_params=sampling_params,
+                block_tables=None,
+            )
+
+        model_input = self.prepare_model_input(
+            [seq], finished_requests_ids=[seq.request_id])
+
+        num_layers = self.model_config.get_num_layers(self.parallel_config)
+
+        assert _sys_length > 0
+        assert len(sys_kv_caches) == num_layers
+        assert sys_kv_caches[0][0] is not None
+
+        kv_caches = [
+            None
+            for _ in range(num_layers)
+        ]
+        input_tokens = torch.tensor(
+            sys_token_ids,
+            dtype=torch.long, device="cuda") # (sys_len)
+        input_positions = torch.tensor(
+            list(range(_sys_length)),
+            dtype=torch.long, device="cuda") # (sys_len)
+
+        with set_forward_context(model_input.attn_metadata):
+            model_input.attn_metadata.prefix_length = -1
+            self.model(input_ids=input_tokens,
+                    positions=input_positions,
+                    kv_caches=kv_caches,
+                    attn_metadata=model_input.attn_metadata,
+                    intermediate_tensors=None,
+                    sys_kv_caches=sys_kv_caches)
+
+        # TODO(aserson) : Update sys_length
+        # # record the prefix length
+        # self.prefix_len = _prefix_length
 
     def remove_all_loras(self):
         if not self.lora_manager:
@@ -1608,6 +1663,7 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
         kv_caches: List[torch.Tensor],
         intermediate_tensors: Optional[IntermediateTensors] = None,
         num_steps: int = 1,
+        sys_kv_caches: Optional[List[torch.Tensor]] = None,
     ) -> Optional[Union[List[SamplerOutput], IntermediateTensors]]:
         if num_steps > 1:
             raise ValueError("num_steps > 1 is not supported in ModelRunner")
@@ -1660,6 +1716,7 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
                 kv_caches=kv_caches,
                 attn_metadata=model_input.attn_metadata,
                 intermediate_tensors=intermediate_tensors,
+                sys_kv_caches=sys_kv_caches,
                 **MultiModalInputs.as_kwargs(multi_modal_kwargs,
                                              device=self.device),
                 **seqlen_agnostic_kwargs)

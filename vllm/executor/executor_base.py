@@ -67,9 +67,21 @@ class ExecutorBase(ABC):
         raise NotImplementedError
 
     @abstractmethod
+    def initialize_sys_cache(self) -> None:
+        """Initialize the system KV cache.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
     def initialize_cache(self, num_gpu_blocks: int,
                          num_cpu_blocks: int) -> None:
         """Initialize the KV cache with the given size in blocks.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def fill_sys_kv_cache(self, sys_token_ids:List[int]) -> None:
+        """Fill the system KV cache with tokens indices.
         """
         raise NotImplementedError
 

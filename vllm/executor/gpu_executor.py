@@ -113,6 +113,11 @@ class GPUExecutor(ExecutorBase):
         """
         return self.driver_worker.determine_num_available_blocks()
 
+    def initialize_sys_cache(self) -> None:
+        """Initialize the system KV cache.
+        """
+        self.driver_worker.initialize_sys_cache()
+
     def initialize_cache(self, num_gpu_blocks: int, num_cpu_blocks) -> None:
         """Initialize the KV cache by invoking the underlying worker.
         """
@@ -127,6 +132,11 @@ class GPUExecutor(ExecutorBase):
                     self.model_config.max_model_len, max_concurrency)
 
         self.driver_worker.initialize_cache(num_gpu_blocks, num_cpu_blocks)
+
+    def fill_sys_kv_cache(self, sys_token_ids) -> None:
+        """Initialize the KV cache with the given size in blocks.
+        """
+        self.driver_worker.fill_sys_kv_cache(sys_token_ids)
 
     def execute_model(
         self, execute_model_req: ExecuteModelRequest

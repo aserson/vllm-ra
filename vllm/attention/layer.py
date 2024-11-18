@@ -36,6 +36,7 @@ class Attention(nn.Module):
         blocksparse_params: Optional[Dict[str, Any]] = None,
         logits_soft_cap: Optional[float] = None,
         prefix: str = "",
+        is_relay_attention: bool = False
     ) -> None:
         super().__init__()
         if cache_config is not None:
@@ -80,7 +81,8 @@ class Attention(nn.Module):
         dtype = torch.get_default_dtype()
         attn_backend = get_attn_backend(head_size, dtype, kv_cache_dtype,
                                         block_size, is_attention_free,
-                                        blocksparse_params is not None)
+                                        blocksparse_params is not None,
+                                        is_relay_attention)
         impl_cls = attn_backend.get_impl_cls()
         self.impl = impl_cls(num_heads, head_size, scale, num_kv_heads,
                              alibi_slopes, sliding_window, kv_cache_dtype,
@@ -94,6 +96,7 @@ class Attention(nn.Module):
         kv_cache: torch.Tensor,
         attn_metadata: AttentionMetadata,
         attn_type: AttentionType = AttentionType.DECODER,
+        sys_kv_cache: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
 
         return self.impl.forward(query,
@@ -103,7 +106,8 @@ class Attention(nn.Module):
                                  attn_metadata,
                                  self._k_scale,
                                  self._v_scale,
-                                 attn_type=attn_type)
+                                 attn_type=attn_type,
+                                 sys_kv_cache=sys_kv_cache)
 
     def extra_repr(self) -> str:
         s = f"head_size={self.impl.head_size}"  # type: ignore

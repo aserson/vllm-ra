@@ -291,24 +291,16 @@ class Worker(LocalOrDistributedWorkerBase):
             f" {free_gpu_memory}. This happens when the GPU memory was "
             "not properly cleaned up before initializing the vLLM instance.")
 
-    @torch.inference_mode()
-    def fill_prefix_kv_cache(self, prefix_token_ids:List[int]):
-        assert self.model_config.enable_relay_attention
-        assert len(prefix_token_ids) <= self.prefix_gpu_cache[0][0].size(1)
-        self.model_runner.fill_prefix_kv_cache(prefix_token_ids, self.prefix_gpu_cache)
-        torch.cuda.synchronize()
-
-    def init_prefix_cache(self) -> None:
+    def initialize_sys_cache(self) -> None:
+        """Allocate GPU system prompt KV cache.
+        """
         # relay attention will use a separate kv cache for the shared prefix
         if self.model_config.enable_relay_attention:
             max_len = self.model_config.max_model_len
             n_kvheads = self.model_config.get_num_kv_heads(self.parallel_config)
             head_dim = self.model_config.get_head_size()
             n_layers = self.model_config.get_num_layers(self.parallel_config)
-            self.prefix_gpu_cache = [(torch.empty(1, max_len, n_kvheads, head_dim,
-                                                  dtype=self.model_config.dtype,
-                                                  device='cuda'),
-                                      torch.empty(1, max_len, n_kvheads, head_dim,
+            self.prefix_gpu_cache = [(torch.empty(2, 1, max_len, n_kvheads, head_dim,
                                                   dtype=self.model_config.dtype,
                                                   device='cuda'))
                                       for _ in range(n_layers) ]
@@ -316,7 +308,6 @@ class Worker(LocalOrDistributedWorkerBase):
             # use a placeholder to keep consistent interface
             n_layers = self.model_config.get_num_layers(self.parallel_config)
             self.prefix_gpu_cache = [(None, None) for _ in range(n_layers) ]
-
 
     def initialize_cache(self, num_gpu_blocks: int,
                          num_cpu_blocks: int) -> None:
@@ -353,6 +344,13 @@ class Worker(LocalOrDistributedWorkerBase):
         # Reset the seed to ensure that the random state is not affected by
         # the model initialization and profiling.
         set_random_seed(self.model_config.seed)
+
+    @torch.inference_mode()
+    def fill_sys_kv_cache(self, sys_token_ids:List[int]) -> None:
+        assert self.model_config.enable_relay_attention
+        assert len(sys_token_ids) <= self.prefix_gpu_cache[0][0].size(1)
+        self.model_runner.fill_sys_kv_cache(sys_token_ids, self.prefix_gpu_cache)
+        torch.cuda.synchronize()
 
     @property
     def do_metadata_broadcast(self) -> bool:

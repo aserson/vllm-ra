@@ -97,6 +97,7 @@ def get_attn_backend(
     block_size: int,
     is_attention_free: bool,
     is_blocksparse: bool = False,
+    is_relay_attention: bool = False
 ) -> Type[AttentionBackend]:
     """Selects which attention backend to use and lazily imports it."""
 
@@ -107,7 +108,7 @@ def get_attn_backend(
         return BlocksparseFlashAttentionBackend
 
     backend = which_attn_to_use(head_size, dtype, kv_cache_dtype, block_size,
-                                is_attention_free)
+                                is_attention_free, is_relay_attention)
     if backend == _Backend.FLASH_ATTN:
         from vllm.attention.backends.flash_attn import (  # noqa: F401
             FlashAttentionBackend)
@@ -168,7 +169,7 @@ def which_attn_to_use(
     kv_cache_dtype: Optional[str],
     block_size: int,
     is_attention_free: bool,
-    is_relay_attention: Optional[bool] = False
+    is_relay_attention: bool
 ) -> _Backend:
     """Returns which flash attention backend to use."""
     # Default case.
