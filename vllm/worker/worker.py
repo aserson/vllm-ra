@@ -119,7 +119,7 @@ class Worker(LocalOrDistributedWorkerBase):
 
         #Prefix GPU Cache
         n_layers = self.model_config.get_num_layers(self.parallel_config)
-        self.prefix_gpu_cache = [(None, None) for _ in range(n_layers) ]
+        self.sys_gpu_cache: Optional[List[List[torch.Tensor]]] = None
 
         # Torch profiler. Enabled and configured through env vars:
         # VLLM_TORCH_PROFILER_DIR=/path/to/save/trace
@@ -300,14 +300,14 @@ class Worker(LocalOrDistributedWorkerBase):
             n_kvheads = self.model_config.get_num_kv_heads(self.parallel_config)
             head_dim = self.model_config.get_head_size()
             n_layers = self.model_config.get_num_layers(self.parallel_config)
-            self.prefix_gpu_cache = [(torch.empty(2, 1, max_len, n_kvheads, head_dim,
+            self.sys_gpu_cache = [[(torch.empty(2, 1, max_len, n_kvheads, head_dim,
                                                   dtype=self.model_config.dtype,
                                                   device='cuda'))
-                                      for _ in range(n_layers) ]
+                                      for _ in range(n_layers) ]]
         else:
             # use a placeholder to keep consistent interface
             n_layers = self.model_config.get_num_layers(self.parallel_config)
-            self.prefix_gpu_cache = [(None, None) for _ in range(n_layers) ]
+            self.sys_gpu_cache = [[(None, None) for _ in range(n_layers) ]]
 
     def initialize_cache(self, num_gpu_blocks: int,
                          num_cpu_blocks: int) -> None:
@@ -348,8 +348,8 @@ class Worker(LocalOrDistributedWorkerBase):
     @torch.inference_mode()
     def fill_sys_kv_cache(self, sys_token_ids:List[int]) -> None:
         assert self.model_config.enable_relay_attention
-        assert len(sys_token_ids) <= self.prefix_gpu_cache[0][0].size(1)
-        self.model_runner.fill_sys_kv_cache(sys_token_ids, self.prefix_gpu_cache)
+        assert len(sys_token_ids) <= self.sys_gpu_cache[0][0][0].size(1)
+        self.model_runner.fill_sys_kv_cache(sys_token_ids, self.sys_gpu_cache[0])
         torch.cuda.synchronize()
 
     @property
@@ -359,6 +359,10 @@ class Worker(LocalOrDistributedWorkerBase):
     @property
     def kv_cache(self) -> Optional[List[List[torch.Tensor]]]:
         return self.gpu_cache
+
+    @property
+    def sys_kv_cache(self) -> Optional[List[List[torch.Tensor]]]:
+        return self.sys_gpu_cache
 
     @torch.inference_mode()
     def prepare_worker_input(

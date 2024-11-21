@@ -216,6 +216,18 @@ class LocalOrDistributedWorkerBase(WorkerBase):
         """
         raise NotImplementedError
 
+    @property
+    @abstractmethod
+    def sys_kv_cache(self) -> Optional[List[List[torch.Tensor]]]:
+        """
+        Gets the list of system prompt kv caches to pass to the worker's model
+        runner. Each element in the list is a kv cache corresponding to a
+        particular virtual engine (PP stream). Used by the default
+        `execute_model`. If the worker's model runner does not follow the
+        ModelRunnerBase interface, then inherit from WorkerBase instead.
+        """
+        raise NotImplementedError
+
     @abstractmethod
     def prepare_worker_input(
             self, execute_model_req: ExecuteModelRequest) -> WorkerInput:
@@ -340,6 +352,8 @@ class LocalOrDistributedWorkerBase(WorkerBase):
             model_input=model_input,
             kv_caches=self.kv_cache[worker_input.virtual_engine]
             if self.kv_cache is not None else None,
+            sys_kv_caches=self.sys_kv_cache[worker_input.virtual_engine]
+            if self.sys_kv_cache is not None else None,
             intermediate_tensors=intermediate_tensors,
             num_steps=num_steps,
             **kwargs,

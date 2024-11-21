@@ -288,7 +288,8 @@ class RelayAttentionImpl(AttentionImpl):
                 k_cache=sys_kv_cache[0], # (1, prefix_length, num_kv_heads, head_size)
                 v_cache=sys_kv_cache[1], # (1, prefix_length, num_kv_heads, head_size)
                 cache_seqlens=attn_metadata.prefix_length_buffer, # (1, )
-                softmax_scale=self.scale)
+                softmax_scale=self.scale,
+                return_softmax_lse=True)
             output_pre:torch.Tensor = output_pre.view(-1, self.num_heads, self.head_size)
             lse_pre:torch.Tensor = lse_pre.squeeze(0)
             trans_lse_pre = True

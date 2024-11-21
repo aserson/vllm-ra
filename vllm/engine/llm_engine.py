@@ -488,8 +488,9 @@ class LLMEngine:
 
         The workers will determine the number of blocks in both the GPU cache
         and the swap CPU cache.
-        """
-        self.model_executor.initialize_sys_cache()
+        """    
+        if self.model_config.enable_relay_attention:
+            self.model_executor.initialize_sys_cache()
 
         num_gpu_blocks, num_cpu_blocks = (
             self.model_executor.determine_num_available_blocks())
