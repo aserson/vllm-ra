@@ -361,8 +361,10 @@ class RelayAttentionImpl(AttentionImpl):
                                                           attn_bias=prefill_meta.attn_bias,
                                                           p=0.0,
                                                           scale=self.scale)
-            output = out.view(num_tokens, self.num_heads, self.head_size)
-            lse = lse.transpose(1, 2).reshape(num_tokens, self.num_heads).contiguous()
+            output = out.view(-1, self.num_heads, self.head_size)
+            lse = lse.transpose(1, 2)
+            lse = lse.reshape(-1, self.num_heads)
+            lse = lse.contiguous()
 
         if decode_meta := attn_metadata.decode_metadata:
             # Decoding run.

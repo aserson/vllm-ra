@@ -872,6 +872,10 @@ class LLMEngine:
             lora_request=lora_request,
             prompt_adapter_request=prompt_adapter_request,
         )
+
+        if self.sys_prompt_config.has_sys_prompt and self.model_config.enable_relay_attention:
+            preprocessed_inputs["prompt_token_ids"] = preprocessed_inputs["prompt_token_ids"][1:]
+
         processed_inputs = self.input_processor(preprocessed_inputs)
 
         # This is a bit of a hack - copy the mm_processor_kwargs that were
