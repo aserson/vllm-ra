@@ -1566,6 +1566,7 @@ class SystemPromptConfig:
         sys_schema: Optional[str] = None,
         sys_prompt_file: Optional[str] = None,
         sys_schema_file: Optional[str] = None,
+        num_sys_tokens: int = 0,
     ) -> None:
         self.prompt = sys_prompt
         self.schema = sys_schema
@@ -1593,6 +1594,10 @@ class SystemPromptConfig:
         else:
             self.prefix_schema = None
             self.request_schema = None
+        self.num_sys_tokens = num_sys_tokens
+
+    def update_num_sys_tokens(self, num_sys_tokens: int):
+        self.num_sys_tokens = num_sys_tokens
 
     def get_shared_prefix(self)->str:
         return self.prefix_schema.format(__SYS_PROMPT=self.prompt)

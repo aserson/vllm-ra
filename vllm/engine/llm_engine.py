@@ -665,6 +665,7 @@ class LLMEngine:
         # TODO (ray): we may need to set the tokenizer to not prepend <bos> token for later requests
         logger.info(f'Filling the shared system prompt kv cache with {len(system_prompt_tokenized)} tokens.')
         self.model_executor.fill_sys_kv_cache(sys_token_ids=system_prompt_tokenized)
+        self.sys_prompt_config.update_num_sys_tokens(len(system_prompt_tokenized))
 
     def _add_processed_request(
         self,
@@ -686,8 +687,10 @@ class LLMEngine:
         seq_id = next(self.seq_counter)
         eos_token_id = self.input_preprocessor.get_eos_token_id(lora_request)
 
+        num_sys_tokens = self.sys_prompt_config.num_sys_tokens
+
         seq = Sequence(seq_id, processed_inputs, block_size, eos_token_id,
-                       lora_request, prompt_adapter_request)
+                       lora_request, prompt_adapter_request, num_sys_tokens=num_sys_tokens)
 
         encoder_seq = None
         if 'encoder_prompt_token_ids' in processed_inputs:
@@ -873,6 +876,8 @@ class LLMEngine:
             prompt_adapter_request=prompt_adapter_request,
         )
 
+        # FIXME (ray): there may be bugs in the tokenizer with relay attention
+        # this is a hack
         if self.sys_prompt_config.has_sys_prompt and self.model_config.enable_relay_attention:
             preprocessed_inputs["prompt_token_ids"] = preprocessed_inputs["prompt_token_ids"][1:]
 

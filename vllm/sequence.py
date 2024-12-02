@@ -177,6 +177,10 @@ class SequenceData(msgspec.Struct,
     # It is used to compute mrope_position_ids.
     _mrope_position_delta: Optional[int] = None
 
+    # TODO(aserson): Is it correct place?
+    # The number of system prompt tokens
+    _num_sys_tokens: int = 0
+
     @staticmethod
     def from_prompt_token_counts(
             *token_counts: Tuple[int, int]) -> "SequenceData":
@@ -313,6 +317,11 @@ class SequenceData(msgspec.Struct,
         """Return the number of prefill tokens that are already computed."""
         return self._num_computed_tokens
 
+    # TODO(aserson): Is it correct place?
+    def get_num_system_tokens(self) -> int:
+        """Return the number of system tokens that are already computed."""
+        return self._num_sys_tokens
+
     def update_num_computed_tokens(self, num_new_computed_tokens: int):
         """Update number of tokens computed so far."""
         self._num_computed_tokens += num_new_computed_tokens
@@ -321,6 +330,11 @@ class SequenceData(msgspec.Struct,
         # If all tokens are computed, it means it is in decoding phase.
         if self.get_num_uncomputed_tokens() == 0:
             self._stage = SequenceStage.DECODE
+
+    # TODO(aserson): Is it correct place?
+    def update_num_system_tokens(self, num_sys_tokens: int):
+        if num_sys_tokens > 0:
+            self._num_sys_tokens = num_sys_tokens
 
     def reset_state_for_recompute(self) -> None:
         """Reset the number of computed tokens from this sequence. It is
@@ -411,6 +425,7 @@ class Sequence:
         lora_request: Optional[LoRARequest] = None,
         prompt_adapter_request: Optional[PromptAdapterRequest] = None,
         from_decoder_prompt: bool = True,
+        num_sys_tokens: int = 0
     ) -> None:
         self.seq_id = seq_id
         self.inputs = inputs
@@ -447,6 +462,7 @@ class Sequence:
                              "encoder input prompt fields?")
 
         self.data = SequenceData.from_seqs(self.prompt_token_ids)
+        self.data.update_num_system_tokens(num_sys_tokens)
         self.output_logprobs: SampleLogprobs = []
         self.output_text = ""
 

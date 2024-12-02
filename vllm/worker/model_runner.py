@@ -482,6 +482,8 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
         else:
             context_len = seq_data.get_num_computed_tokens()
 
+        sys_len = seq_data.get_num_system_tokens()
+
         # Compute tokens.
         tokens = seq_data.get_token_ids()[context_len:seq_len]
 
@@ -489,7 +491,7 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
         inter_data.orig_seq_lens[seq_idx] = seq_len
         inter_data.context_lens[seq_idx] = context_len
         inter_data.input_tokens[seq_idx].extend(tokens)
-        inter_data.input_positions[seq_idx].extend(range(context_len, seq_len))
+        inter_data.input_positions[seq_idx].extend(range(context_len + sys_len, seq_len + sys_len))
         inter_data.query_lens[seq_idx] = seq_len - context_len
 
         if seq_data.mrope_position_delta is not None:

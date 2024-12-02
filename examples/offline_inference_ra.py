@@ -18,7 +18,7 @@ sampling_params = SamplingParams(temperature=0.8, top_p=0.95, max_tokens=256)
 
 # Create an LLM.    
 llm = LLM(model="meta-llama/Llama-2-7b-chat-hf", enforce_eager=True,
-          enable_relay_attention=True,  
+          enable_relay_attention=True,
           sys_prompt=sys_prompt,
           sys_schema=sys_schema,)
 # Generate texts from the prompts. The output is a list of RequestOutput objects
