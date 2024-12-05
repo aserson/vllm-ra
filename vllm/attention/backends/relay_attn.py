@@ -269,15 +269,15 @@ class RelayAttentionImpl(AttentionImpl):
         """
         num_tokens, hidden_size = query.shape
 
-        if prefill_meta := attn_metadata.prefill_metadata:
-            # fill the sys kv cache here
-            # NOTE: this happens only when we fill sys kv cache
-            # by passing input_metadata.sys_length=-1 as the signal
-            if attn_metadata.prefix_length < 0:
-                assert (kv_cache is None) and (sys_kv_cache is not None)
-                assert self.num_kv_heads * self.head_size == hidden_size
-                sys_kv_cache[0, :, :num_tokens, :, :] = key.unflatten(-1, (self.num_kv_heads, self.head_size))     #
-                sys_kv_cache[1, :, :num_tokens, :, :] = value.unflatten(-1, (self.num_kv_heads, self.head_size))
+        # fill the sys kv cache here
+        # NOTE: this happens only when we fill sys kv cache
+        # by passing input_metadata.sys_length=-1 as the signal
+        if attn_metadata.prefix_length < 0:
+            assert attn_metadata.max_decode_seq_len == 0
+            assert (kv_cache is None) and (sys_kv_cache is not None)
+            assert self.num_kv_heads * self.head_size == hidden_size
+            sys_kv_cache[0, :, :num_tokens, :, :] = key.unflatten(-1, (self.num_kv_heads, self.head_size))     #
+            sys_kv_cache[1, :, :num_tokens, :, :] = value.unflatten(-1, (self.num_kv_heads, self.head_size))
 
         if attn_metadata.prefix_length > 0:
             # FIXME (ray): window attention
@@ -348,6 +348,8 @@ class RelayAttentionImpl(AttentionImpl):
                     attn_bias = attn_bias.make_local_attention(
                         self.sliding_window)
                 prefill_meta.attn_bias = attn_bias
+            else:
+                attn_bias = prefill_meta.attn_bias
 
             # [1, bsz*seqlen, head_groups, num_heads_per_group, K]
             query = query.unsqueeze(0)
@@ -357,13 +359,13 @@ class RelayAttentionImpl(AttentionImpl):
             out, lse = memory_efficient_attention_forward(query,
                                                           key,
                                                           value,
-                                                          attn_bias=prefill_meta.attn_bias,
+                                                          attn_bias=attn_bias,
                                                           p=0.0,
                                                           scale=self.scale)
             output = out.view(-1, self.num_heads, self.head_size)
-            lse = lse.transpose(1, 2)
-            lse = lse.reshape(-1, self.num_heads)
+            lse = torch.cat([lse[i, :, :seqlen] for i, seqlen in enumerate(attn_metadata.seq_lens)], dim=1)
             lse = lse.contiguous()
+            trans_lse_usr = True
 
         if decode_meta := attn_metadata.decode_metadata:
             # Decoding run.
@@ -389,6 +391,7 @@ class RelayAttentionImpl(AttentionImpl):
                 # CUDA graphs.
                 output = torch.zeros_like(query)
                 lse = torch.zeros(num_tokens, self.num_heads)
+            trans_lse_usr = False
 
         if attn_metadata.prefix_length > 0:
             # print(output.stride())
@@ -397,7 +400,8 @@ class RelayAttentionImpl(AttentionImpl):
             # print(lse_pre.size(), lse_pre.stride())
             # print('------')
             output = relay_fusion(output_pre, lse_pre, output, lse,
-                                  backend='triton', trans_lse_sys=trans_lse_pre)
+                                  backend='triton', trans_lse_sys=trans_lse_pre,
+                                  trans_lse_usr=trans_lse_usr)
             # output = output
 
         # print(output.stride())
