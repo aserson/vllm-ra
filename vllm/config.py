@@ -1582,15 +1582,13 @@ class SystemPromptConfig:
             self.prompt = self.prompt.strip()
             self.has_sys_prompt = len(self.prompt) > 0
         if self.has_sys_prompt:
-            assert ( isinstance(self.schema, str)
-                and len(self.schema) > 0 )
-            substring = "{__USR_PROMPT}"
-            index = self.schema.find(substring)
-            assert index > 0
-            self.prefix_schema= self.schema[:index]
-            assert "{__SYS_PROMPT}" in  self.prefix_schema
-            self.request_schema = self.schema[index:]
-            assert self.request_schema.startswith(substring)
+            if self.schema is None:
+                self.prefix_schema = "{__SYS_PROMPT}\n\n"
+                self.request_schema = "{__USR_PROMPT}"
+            else:
+                assert ( isinstance(self.schema, str)
+                    and len(self.schema) > 0 )
+                self._update_schemes()
         else:
             self.prefix_schema = None
             self.request_schema = None
@@ -1598,6 +1596,19 @@ class SystemPromptConfig:
 
     def update_num_sys_tokens(self, num_sys_tokens: int):
         self.num_sys_tokens = num_sys_tokens
+
+    def update_sys_schema(self, sys_schema: Optional[str] = None):
+        if sys_schema is not None:
+            assert ( isinstance(sys_schema, str)
+                and len(sys_schema) > 0 )
+            index = sys_schema.find("<s>")
+            if index == -1:
+                self.schema = sys_schema
+            else:
+                assert index == 0
+                self.schema = sys_schema[len('<s>'):]
+
+            self._update_schemes()
 
     def get_shared_prefix(self)->str:
         return self.prefix_schema.format(__SYS_PROMPT=self.prompt)
@@ -1609,6 +1620,15 @@ class SystemPromptConfig:
         else:
             formatted = self.request_schema.format(__USR_PROMPT=user_prompt.strip())
         return formatted
+
+    def _update_schemes(self):
+        substring = "{__USR_PROMPT}"
+        index = self.schema.find(substring)
+        assert index > 0
+        self.prefix_schema= self.schema[:index]
+        assert "{__SYS_PROMPT}" in  self.prefix_schema
+        self.request_schema = self.schema[index:]
+        assert self.request_schema.startswith(substring)
 
 @dataclass
 class LoRAConfig:

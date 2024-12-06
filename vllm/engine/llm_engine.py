@@ -316,10 +316,23 @@ class LLMEngine:
             self.tokenizer = self._init_tokenizer()
             self.detokenizer = Detokenizer(self.tokenizer)
             tokenizer_group = self.get_tokenizer_group()
+
+            conversation = [
+                    {"role": "system", "content": "{__SYS_PROMPT}"},
+                    {"role": "user", "content": "{__USR_PROMPT}"}
+            ]
+
+            sys_schema = tokenizer_group.tokenizer.apply_chat_template(
+                conversation=conversation,
+                tokenize=False
+            )
         else:
             self.tokenizer = None
             self.detokenizer = None
             tokenizer_group = None
+            sys_schema = None
+
+        self.sys_prompt_config.update_sys_schema(sys_schema)
 
         # Ensure that the function doesn't contain a reference to self,
         # to avoid engine GC issues
