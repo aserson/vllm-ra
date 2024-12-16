@@ -1583,7 +1583,7 @@ class SystemPromptConfig:
             self.has_sys_prompt = len(self.prompt) > 0
         if self.has_sys_prompt:
             if self.schema is None:
-                self.prefix_schema = "{__SYS_PROMPT}\n\n"
+                self.system_schema = "{__SYS_PROMPT}\n\n"
                 self.request_schema = "{__USR_PROMPT}"
             else:
                 assert ( isinstance(self.schema, str)
@@ -1593,6 +1593,10 @@ class SystemPromptConfig:
             self.prefix_schema = None
             self.request_schema = None
         self.num_sys_tokens = num_sys_tokens
+
+    def update_sys_prompt(self, system_prompt:str):
+        self.prompt = system_prompt
+        self.has_sys_prompt = len(self.prompt) > 0
 
     def update_num_sys_tokens(self, num_sys_tokens: int):
         self.num_sys_tokens = num_sys_tokens
@@ -1610,8 +1614,8 @@ class SystemPromptConfig:
 
             self._update_schemes()
 
-    def get_shared_prefix(self)->str:
-        return self.prefix_schema.format(__SYS_PROMPT=self.prompt)
+    def get_system_prompt(self)->str:
+        return self.system_schema.format(__SYS_PROMPT=self.prompt)
 
     def get_formatted_request(self, user_prompt:str, include_sys_prompt:bool)->str:
         if include_sys_prompt:
@@ -1625,8 +1629,8 @@ class SystemPromptConfig:
         substring = "{__USR_PROMPT}"
         index = self.schema.find(substring)
         assert index > 0
-        self.prefix_schema= self.schema[:index]
-        assert "{__SYS_PROMPT}" in  self.prefix_schema
+        self.system_schema= self.schema[:index]
+        assert "{__SYS_PROMPT}" in  self.system_schema
         self.request_schema = self.schema[index:]
         assert self.request_schema.startswith(substring)
 

@@ -525,7 +525,7 @@ class LLMEngine:
         if self.model_config.enable_relay_attention:
             if self.sys_prompt_config.has_sys_prompt:
                 self.fill_sys_kv_cache(
-                    system_prompt=self.sys_prompt_config.get_shared_prefix())
+                    system_prompt=self.sys_prompt_config.get_system_prompt())
             else:
                 logger.warning("Though enable_relay_attention is set as true, "
                                "relay attention is not activated due to no system "

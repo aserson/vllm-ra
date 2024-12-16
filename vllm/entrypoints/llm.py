@@ -395,6 +395,11 @@ class LLM:
         outputs = self._run_engine(use_tqdm=use_tqdm)
         return LLMEngine.validate_outputs(outputs, RequestOutput)
 
+    def fill_sys_prompt(self, system_prompt:str):
+        self.llm_engine.sys_prompt_config.update_sys_prompt(system_prompt)
+        self.llm_engine.fill_sys_kv_cache(
+            system_prompt=self.llm_engine.sys_prompt_config.get_system_prompt())
+
     def beam_search(
         self,
         prompts: List[Union[str, List[int]]],
