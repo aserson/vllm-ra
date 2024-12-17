@@ -21,41 +21,57 @@ sys_prompt = """
     Your wife's name is Isabella.
     """
 
+# small sys prompt
 # sys_prompt = """
 #     Ahoy, Matey! Your name is John, 50 years old. Your favorite color is red. You also have a son named Jimmy, he's a senior software engineer building AI models in your home village named "Retardio". Speak like a pirate. Your wife's name is Isabella.
 #     """
 
 if __name__ == "__main__":
-    ITER_NUM = 3
-    # RA = True
-    RA = False
-    PREFIX = True
-    # PREFIX = False
+    #### PARAMS -> BEGIN
+    ITER_NUM = 4
+    RA = True
+    # RA = False
+    # PREFIX = True
+    PREFIX = False
+    TP = 1
+    # TP = 4
+    # MAX_MODEL_LEN = 600
+    MAX_MODEL_LEN = 4096
+    EAGER = True
+    # EAGER = False
+    GPU_MEM_UTIL = 0.95
 
-    if len(sys.argv) <= 1 or len(sys.argv) >= 5:
-        print("Usage: python offline_inference_ra.py [0/1]:ENABLE_RA [0/1]:ITER_NUM [0/1]:ENABLE_PREFIX")
+    # model_name = "meta-llama/Llama-2-7b-chat-hf"
+    model_name = "meta-llama/Llama-2-13b-chat-hf"
+    # model_name = "meta-llama/Llama-2-70b-chat-hf"
+    ### <- END
+
+    if len(sys.argv) <= 1 or len(sys.argv) >= 6:
+        print("Usage: python offline_inference_ra.py [0/1]:ENABLE_RA [0/1]:ITER_NUM [0/1]:ENABLE_PREFIX [1-8]:TP")
+        print("Default params are used")
     else:
         if len(sys.argv) >= 2:
             RA = sys.argv[1] == "1"
         if len(sys.argv) >= 3:
             ITER_NUM = int(sys.argv[2])
-            assert ITER_NUM > 0
-            assert ITER_NUM < 11
+            assert ITER_NUM in [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
         if len(sys.argv) >= 3:
             PREFIX = sys.argv[3] == "1"
+        if len(sys.argv) >= 4:
+            TP = int(sys.argv[4])
+            assert TP in [1, 2, 3, 4, 5, 6, 7, 8]
 
-    print(f"CONFIG\nRA={RA}, ITER_NUM={ITER_NUM}, PREFIX={PREFIX}\n")
-
-    model_name = "meta-llama/Llama-2-7b-chat-hf"
+    print(f"CONFIG\nRA={RA}, ITER_NUM={ITER_NUM}, PREFIX={PREFIX}, TP={TP}, EAGER={EAGER}\n")
     tokenizer = AutoTokenizer.from_pretrained(model_name)
 
     # Create an LLM with system prompt
     llm = LLM(model=model_name,
-              enforce_eager=True,
+              enforce_eager=EAGER,
               enable_relay_attention=RA,
               enable_prefix_caching=PREFIX,
-              max_model_len=256,
-              gpu_memory_utilization=0.98,
+              max_model_len=MAX_MODEL_LEN,
+              gpu_memory_utilization=GPU_MEM_UTIL,
+              tensor_parallel_size=TP,
               )
     if RA:
         t = time.perf_counter()
@@ -63,6 +79,7 @@ if __name__ == "__main__":
         t = time.perf_counter() - t
         print(f"\nSys prompt processing walltime: {t:.3f} seconds\n\n")
 
+    times = []
     for it in range(1, ITER_NUM + 1):
         print(f"Iteration {it} begins")
         # User prompts.
@@ -91,7 +108,7 @@ if __name__ == "__main__":
                 pr = tokenizer.apply_chat_template(message, tokenize=False, add_special_tokens=True)
                 prompts.append(pr)
 
-        print(f"Prompts:\n" + "\n".join(str(p) for p in prompts))
+        # print(f"Prompts:\n" + "\n".join(str(p) for p in prompts))
 
         # Create a sampling params object.
         sampling_params = SamplingParams(temperature=0, min_tokens=256, max_tokens=256)
@@ -106,10 +123,17 @@ if __name__ == "__main__":
         # Print the outputs.
         for output in outputs:
             index = output.prompt.find("[/INST]")
+            index2 = output.prompt.find("<</SYS>>")
             if index != -1:
-                prompt = output.prompt[:index]
+                if index2 != -1:
+                    prompt = output.prompt[index2:index]
+                else:
+                    prompt = output.prompt[:index]
             else:
                 prompt = output.prompt
+
             generated_text = output.outputs[0].text
             print(f"Q: {prompt!r}\nA: {generated_text!r}")
-        print(f"\nITERATION {it}. Walltime: {t:.3f} seconds\n\n")
+        print(f"\nITERATION {it}. Walltime: {t:.3f} seconds\n")
+        times.append(t)
+    print(f"Walltimes: {times}\n\n")
