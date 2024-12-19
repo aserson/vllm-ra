@@ -17,7 +17,7 @@ sampling_params = SamplingParams(temperature=0.8, top_p=0.95, max_tokens=256)
 
 # Create an LLM with system prompt
 llm = LLM(model="meta-llama/Llama-2-7b-chat-hf",
-          enforce_eager=True,
+          enforce_eager=False,
           enable_relay_attention=True)
 
 llm.fill_sys_prompt(sys_prompt)

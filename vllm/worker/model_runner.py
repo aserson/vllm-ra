@@ -1360,7 +1360,7 @@ class GPUModelRunnerBase(ModelRunnerBase[TModelInputForGPU]):
                     attn_metadata=model_input.attn_metadata,
                     intermediate_tensors=None,
                     sys_kv_caches=sys_kv_caches)
-            
+
         self.sys_length=_sys_length
 
     def remove_all_loras(self):
@@ -1435,7 +1435,7 @@ class GPUModelRunnerBase(ModelRunnerBase[TModelInputForGPU]):
         return uses_mrope(self.model_config.hf_config)
 
     @torch.inference_mode()
-    def capture_model(self, kv_caches: List[List[torch.Tensor]]) -> None:
+    def capture_model(self, kv_caches: List[List[torch.Tensor]], sys_kv_caches: List[List[torch.Tensor]]) -> None:
         """Cuda graph capture a model.
 
         Note that CUDA graph's performance gain is negligible if number
@@ -1508,6 +1508,14 @@ class GPUModelRunnerBase(ModelRunnerBase[TModelInputForGPU]):
                             is_encoder_decoder_model=self.model_config.
                             is_encoder_decoder_model))
 
+                    if self.model_config.enable_relay_attention:
+                        attn_metadata.sys_length = self.max_seq_len_to_capture
+                        attn_metadata.sys_length_tensor = torch.tensor(
+                            [self.max_seq_len_to_capture],
+                            dtype=torch.int32,
+                            device="cuda"
+                        )
+
                     if self.lora_config:
                         lora_mapping = LoRAMapping(
                             **dict(index_mapping=[0] * batch_size,
@@ -1545,6 +1553,8 @@ class GPUModelRunnerBase(ModelRunnerBase[TModelInputForGPU]):
                         kv_caches[virtual_engine],
                         "attn_metadata":
                         attn_metadata,
+                        "sys_kv_caches":
+                        sys_kv_caches[virtual_engine],
                         "memory_pool":
                         self.graph_memory_pool,
                         "stream":
@@ -1642,12 +1652,13 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
         """
         model_input = self._prepare_model_input_tensors(
             seq_group_metadata_list, finished_requests_ids)
-        if self.is_relay_attention and (self.sys_length != 0):
-            model_input.attn_metadata.prefix_length = self.sys_length
-            model_input.attn_metadata.prefix_length_buffer = torch.tensor(
+        if self.is_relay_attention:
+            model_input.attn_metadata.sys_length = self.sys_length
+            model_input.attn_metadata.sys_length_tensor = torch.tensor(
                                             [self.sys_length],
                                             dtype=torch.int32,
-                                            device='cuda')
+                                            device="cuda")
+
         if get_pp_group().is_last_rank:
             # Sampling metadata is only required for the final pp group
             generators = self.get_generators(finished_requests_ids)
@@ -1833,6 +1844,7 @@ class CUDAGraphRunner(nn.Module):
         intermediate_inputs: Optional[IntermediateTensors],
         kv_caches: List[torch.Tensor],
         attn_metadata: AttentionMetadata,
+        sys_kv_caches: List[torch.Tensor],
         memory_pool: Optional[Tuple[int, int]],
         stream: torch.cuda.Stream,
         **kwargs,
@@ -1848,6 +1860,7 @@ class CUDAGraphRunner(nn.Module):
                 positions=positions,
                 kv_caches=kv_caches,
                 attn_metadata=attn_metadata,
+                sys_kv_caches=sys_kv_caches,
                 intermediate_tensors=intermediate_inputs,
                 **kwargs,
             )
@@ -1862,6 +1875,7 @@ class CUDAGraphRunner(nn.Module):
                 positions=positions,
                 kv_caches=kv_caches,
                 attn_metadata=attn_metadata,
+                sys_kv_caches=sys_kv_caches,
                 intermediate_tensors=intermediate_inputs,
                 **kwargs,
             )
@@ -1891,10 +1905,16 @@ class CUDAGraphRunner(nn.Module):
             positions,
             "kv_caches":
             kv_caches,
+            "sys_kv_caches":
+            sys_kv_caches,
             **self.attn_state.get_graph_input_buffers(
                 attn_metadata, self._is_encoder_decoder_model),
             **kwargs,
         }
+
+        if (self.backend_name == "RELAY_ATTN"):
+            self.input_buffers["sys_length"] = attn_metadata.sys_length_tensor
+
         if intermediate_inputs is not None:
             self.input_buffers.update(intermediate_inputs.tensors)
         if get_pp_group().is_last_rank:
@@ -1911,15 +1931,21 @@ class CUDAGraphRunner(nn.Module):
         positions: torch.Tensor,
         kv_caches: List[torch.Tensor],
         attn_metadata: AttentionMetadata,
+        sys_kv_caches: List[torch.Tensor],
         intermediate_tensors: Optional[IntermediateTensors],
         **kwargs,
     ) -> torch.Tensor:
         # KV caches are fixed tensors, so we don't need to copy them.
         del kv_caches
+        del sys_kv_caches
 
         # Copy the input tensors to the input buffers.
         self.input_buffers["input_ids"].copy_(input_ids, non_blocking=True)
         self.input_buffers["positions"].copy_(positions, non_blocking=True)
+        self.input_buffers["sys_length"].copy_(
+            torch.tensor([attn_metadata.sys_length], dtype=torch.int32, device="cuda"),
+            non_blocking=True,
+        )
 
         if self.backend_name != "NO_ATTENTION":
             self.input_buffers["slot_mapping"].copy_(

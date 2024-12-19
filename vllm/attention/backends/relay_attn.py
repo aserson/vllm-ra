@@ -122,6 +122,9 @@ class RelayAttentionMetadata(AttentionMetadata):
     # Maximum query length in the batch. None for decoding.
     max_query_len: Optional[int] = None
 
+    # Max number of query tokens among request in the batch.
+    max_decode_query_len: Optional[int] = None
+
     # (batch_size + 1,). The cumulative subquery lengths of the sequences in
     # the batch, used to index into subquery. E.g., if the subquery length
     # is [4, 6], it is [0, 4, 10].
@@ -142,8 +145,8 @@ class RelayAttentionMetadata(AttentionMetadata):
 
     def __post_init__(self):
         self.attn_bias: Optional[List[AttentionBias]] = None
-        self.prefix_length: int = 0
-        self.prefix_length_buffer: Optional[torch.Tensor] = None
+        self.sys_length: int = 0
+        self.sys_length_tensor: Optional[torch.Tensor] = None
 
     @property
     def prefill_metadata(self) -> Optional["RelayAttentionMetadata"]:
@@ -272,21 +275,22 @@ class RelayAttentionImpl(AttentionImpl):
         # fill the sys kv cache here
         # NOTE: this happens only when we fill sys kv cache
         # by passing input_metadata.sys_length=-1 as the signal
-        if attn_metadata.prefix_length < 0:
+        if attn_metadata.sys_length < 0:
             assert attn_metadata.max_decode_seq_len == 0
             assert (kv_cache is None) and (sys_kv_cache is not None)
             assert self.num_kv_heads * self.head_size == hidden_size
             sys_kv_cache[0, :, :num_tokens, :, :] = key.unflatten(-1, (self.num_kv_heads, self.head_size))     #
             sys_kv_cache[1, :, :num_tokens, :, :] = value.unflatten(-1, (self.num_kv_heads, self.head_size))
 
-        if attn_metadata.prefix_length > 0:
+        if attn_metadata.sys_length > 0:
+            assert attn_metadata.sys_length_tensor is not None
             # FIXME (ray): window attention
             # NOTE: flash attention natively supports MQA/GQA
             output_pre, lse_pre = flash_attn_with_kvcache(
                 q=query.view(1, -1, self.num_heads, self.head_size), # (1, bsz*len, num_heads, head_size)
-                k_cache=sys_kv_cache[0], # (1, prefix_length, num_kv_heads, head_size)
-                v_cache=sys_kv_cache[1], # (1, prefix_length, num_kv_heads, head_size)
-                cache_seqlens=attn_metadata.prefix_length_buffer, # (1, )
+                k_cache=sys_kv_cache[0], # (1, sys_length, num_kv_heads, head_size)
+                v_cache=sys_kv_cache[1], # (1, sys_length, num_kv_heads, head_size)
+                cache_seqlens=attn_metadata.sys_length_tensor, # (1, )
                 softmax_scale=self.scale,
                 return_softmax_lse=True)
             output_pre:torch.Tensor = output_pre.view(-1, self.num_heads, self.head_size)
@@ -393,7 +397,7 @@ class RelayAttentionImpl(AttentionImpl):
                 lse = torch.zeros(num_tokens, self.num_heads)
             trans_lse_usr = False
 
-        if attn_metadata.prefix_length > 0:
+        if attn_metadata.sys_length > 0:
             # print(output.stride())
             # print(output_pre.stride())
             # print(lse.size(), lse.stride())
